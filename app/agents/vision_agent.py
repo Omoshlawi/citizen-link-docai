@@ -155,7 +155,12 @@ class VisionAgent:
         )
 
     async def _download_image(self, url: str) -> tuple[bytes, str]:
-        """Download an image from a pre-signed S3 URL and return (bytes, mime_type)."""
+        """
+        Download a document image from a pre-signed MinIO URL.
+
+        NestJS generates the pre-signed URL before calling docai — the
+        signature is embedded in the URL so no credentials are needed here.
+        """
         async with httpx.AsyncClient(timeout=30) as http:
             response = await http.get(url)
             response.raise_for_status()
@@ -224,7 +229,7 @@ class VisionAgent:
         page_results = []
 
         for page_num, url in enumerate(image_urls, start=1):
-            log.info("vision_agent_downloading_image", page=page_num, url=url[:60])
+            log.info("vision_agent_downloading_image", page=page_num, url=url[:80])
             image_bytes, mime_type = await self._download_image(url)
 
             correction_prompt: Optional[str] = None

@@ -14,7 +14,11 @@ from urllib.parse import urlparse, urlunparse
 
 import psycopg2
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
+
+# Load .env so DATABASE_URL is available when running alembic from the CLI
+load_dotenv()
 
 # ── Alembic Config object ───────────────────────────────────────────────────────
 config = context.config

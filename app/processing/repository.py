@@ -4,8 +4,7 @@ ProcessingRepository — raw SQL operations on the processing_jobs table.
 All queries use asyncpg directly — no ORM.
 """
 
-from typing import Optional
-from uuid import UUID
+from typing import List, Optional, Tuple
 
 import asyncpg
 import structlog
@@ -56,6 +55,43 @@ class ProcessingRepository:
             "SELECT * FROM processing_jobs WHERE id = $1::uuid",
             job_id,
         )
+
+    async def list_jobs(
+        self,
+        status: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Tuple[List[asyncpg.Record], int]:
+        """
+        Return a paginated list of jobs and the total count.
+        Optionally filter by status (PENDING, IN_PROGRESS, COMPLETED, FAILED).
+        """
+        offset = (page - 1) * page_size
+        params: list = []
+        where = ""
+
+        if status:
+            params.append(status)
+            where = "WHERE status = $1"
+
+        rows = await self._pool.fetch(
+            f"""
+            SELECT * FROM processing_jobs
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+            """,
+            *params,
+            page_size,
+            offset,
+        )
+
+        total: int = await self._pool.fetchval(
+            f"SELECT COUNT(*) FROM processing_jobs {where}",
+            *params,
+        )
+
+        return rows, total
 
     async def update_status(
         self,
