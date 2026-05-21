@@ -48,6 +48,10 @@ class JobStatusResponse(BaseModel):
     updated_at: datetime
 
 
+class ProcessResponse(BaseModel):
+    job_id: str = Field(..., description="UUID of the queued extraction job")
+
+
 class JobListResponse(BaseModel):
     jobs: List[JobStatusResponse]
     total: int

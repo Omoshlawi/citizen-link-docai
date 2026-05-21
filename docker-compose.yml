@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
 
   db:
-    image: pgvector/pgvector:0.8.0-pg16
+    image: postgres:16-alpine
     environment:
       POSTGRES_DB: citizen-link-docai
       POSTGRES_USER: docai

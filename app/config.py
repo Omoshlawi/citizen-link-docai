@@ -25,9 +25,8 @@ class Settings(BaseSettings):
     internal_secret: str
 
     # ── Callback (webhook sent by docai after each pipeline stage) ────────────
-    # URL of the caller's webhook receiver — docai POSTs stage updates here.
-    callback_url: str
     # Secret docai sends on every callback so the caller can validate the request.
+    # The callback URL itself is provided per-job in POST /v1/process.
     callback_secret: str
 
     # ── Vision Model ───────────────────────────────────────────────────────────

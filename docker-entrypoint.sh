@@ -13,10 +13,6 @@ if [ -z "$INTERNAL_SECRET" ]; then
   exit 1
 fi
 
-if [ -z "$CALLBACK_URL" ]; then
-  echo "❌ CALLBACK_URL is not set. Exiting."
-  exit 1
-fi
 
 echo "🗄️  Running Alembic migrations..."
 alembic upgrade head && echo "✅ Migrations applied." || { echo "❌ Migrations failed. Exiting."; exit 1; }

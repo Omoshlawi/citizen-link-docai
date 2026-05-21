@@ -10,14 +10,13 @@ Authentication: X-Internal-Secret + X-User-Id (require_internal_auth).
 
 import structlog
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
 from typing import Optional
 
 from app.config import Settings, get_settings
 from app.dependencies import get_pool, require_internal_auth
 from app.exceptions import NotFoundError
 from app.processing.repository import ProcessingRepository
-from app.processing.schemas import JobListResponse, JobStatusResponse, ProcessRequest
+from app.processing.schemas import JobListResponse, JobStatusResponse, ProcessRequest, ProcessResponse
 from app.processing.service import ProcessingService
 
 log = structlog.get_logger(__name__)
@@ -50,24 +49,21 @@ def _row_to_job(row) -> JobStatusResponse:
     )
 
 
-@router.post("/process", status_code=202)
+@router.post("/process", status_code=202, response_model=ProcessResponse)
 async def submit_process(
     body: ProcessRequest,
     user_id: str = Depends(require_internal_auth),
     svc: ProcessingService = Depends(get_processing_service),
-) -> JSONResponse:
+) -> ProcessResponse:
     """
-    Accept an extraction job from NestJS.
+    Accept an extraction job from the caller.
 
     Returns 202 immediately — processing happens asynchronously via ARQ.
-    NestJS receives progress via webhook callbacks as each stage completes.
+    The caller receives progress via webhook callbacks as each stage completes.
     """
     job_id = await svc.submit_job(body)
     log.info("process_request_accepted", job_id=job_id, user_id=user_id)
-    return JSONResponse(
-        status_code=202,
-        content={"jobId": job_id, "status": "PENDING"},
-    )
+    return ProcessResponse(job_id=job_id)
 
 
 @router.get("/jobs", response_model=JobListResponse)
