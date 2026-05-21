@@ -35,15 +35,9 @@ def _row_to_job(row) -> JobStatusResponse:
     """Convert an asyncpg Record to a JobStatusResponse."""
     return JobStatusResponse(
         job_id=str(row["id"]),
-        external_case_id=row["external_case_id"],
-        external_document_id=row["external_document_id"],
-        external_extraction_id=row["external_extraction_id"],
-        external_user_id=row["external_user_id"],
-        case_type=row["case_type"],
         case_number=row["case_number"],
         status=row["status"],
         current_stage=row["current_stage"],
-        error_message=row["error_message"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

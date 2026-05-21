@@ -7,15 +7,17 @@ and auto-corrects up to MAX_AGENT_ITERATIONS rounds if validation fails.
 Output schema mirrors NestJS VisionExtractionOutputSchema (vision.dto.ts).
 """
 
+import base64
 import json
 import re
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 import structlog
 from openai import AsyncOpenAI
 
+from app.agents.exceptions import AgentExhaustedError
 from app.config import Settings
 
 log = structlog.get_logger(__name__)
@@ -140,10 +142,10 @@ class VisionAgent:
     """
     Agentic vision extraction — call → validate → auto-correct, max N rounds.
 
-    Each failed round sends a correction prompt that includes:
-    - The validation errors from the previous attempt
-    - The raw output that was rejected
-    - A reminder of the exact schema required
+    The LLM receives a proper multi-turn conversation that grows with each
+    failed round: its own bad output appears as an assistant message, and the
+    validation errors arrive as the next user message. This mirrors how the
+    model was trained for self-correction tasks.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -167,39 +169,29 @@ class VisionAgent:
         content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
         return response.content, content_type
 
-    async def _call_llm(
-        self,
-        image_bytes: bytes,
-        mime_type: str,
-        correction_prompt: Optional[str] = None,
-    ) -> tuple[str, dict]:
-        """
-        Call the vision LLM with the image.
-        On correction rounds, prepend the correction message.
-        Returns (raw_text, usage_dict).
-        """
-        import base64
-
+    def _build_initial_messages(self, image_bytes: bytes, mime_type: str) -> list[dict]:
+        """Build the opening system + user messages for a page."""
         b64 = base64.b64encode(image_bytes).decode()
-        image_url = f"data:{mime_type};base64,{b64}"
+        return [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_USER_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+                ],
+            },
+        ]
 
-        user_content: list[dict] = []
-
-        if correction_prompt:
-            user_content.append({"type": "text", "text": correction_prompt})
-
-        user_content.append({"type": "text", "text": VISION_USER_PROMPT})
-        user_content.append(
-            {"type": "image_url", "image_url": {"url": image_url}}
-        )
-
+    async def _call_llm(self, messages: list[dict]) -> tuple[str, dict]:
+        """
+        Send the current conversation to the vision LLM and return (raw_text, usage).
+        `messages` grows across rounds: system → user → assistant → user → ...
+        """
         start = time.perf_counter()
         response = await self._client.chat.completions.create(
             model=self._model,
-            messages=[
-                {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
+            messages=messages,
             temperature=0.2,
             max_tokens=4096,
         )
@@ -216,95 +208,84 @@ class VisionAgent:
     async def extract(
         self,
         image_urls: list[str],
-    ) -> tuple[dict, list[dict]]:
+    ) -> tuple[dict, list[dict], list[dict]]:
         """
         Run vision extraction on all provided images.
 
         Returns:
-            (result, usage_logs) where:
-              result    — validated vision output dict (with fullText + averageConfidence)
-              usage_logs — list of per-call usage dicts for ai_usage_logs table
+            (result, usage_logs, conversation) where:
+              result       — validated vision output dict (with fullText + averageConfidence)
+              usage_logs   — list of per-call usage dicts (aggregated by tasks into processing_stages.usage)
+              conversation — list of correction-round records for audit/debugging
         """
-        usage_logs = []
-        page_results = []
+        provider = (
+            "ollama"
+            if "ollama" in self._model.lower() or "11434" in str(self._client.base_url)
+            else "openai"
+        )
+        usage_logs: list[dict] = []
+        conversation: list[dict] = []
+        page_results: list[dict] = []
 
         for page_num, url in enumerate(image_urls, start=1):
             log.info("vision_agent_downloading_image", page=page_num, url=url[:80])
             image_bytes, mime_type = await self._download_image(url)
 
-            correction_prompt: Optional[str] = None
-            last_raw: Optional[str] = None
-            last_errors: list[str] = []
+            # Build the conversation history for this page.
+            # Each failed round appends:  assistant (bad output) → user (correction).
+            # The LLM therefore sees its own prior attempts in the assistant role.
+            messages = self._build_initial_messages(image_bytes, mime_type)
+            correction_text: Optional[str] = None  # recorded for the conversation trail
 
             for attempt in range(1, self._max_iterations + 1):
-                log.info(
-                    "vision_agent_calling_llm",
-                    page=page_num,
-                    attempt=attempt,
-                    model=self._model,
-                )
-                raw_text, usage = await self._call_llm(
-                    image_bytes, mime_type, correction_prompt
-                )
-                usage_logs.append(
-                    {
-                        "stage": "VISION",
-                        "model": self._model,
-                        "provider": "ollama" if "ollama" in self._model.lower() or "11434" in str(self._client.base_url) else "openai",
-                        **usage,
-                        "success": True,
-                    }
-                )
+                log.info("vision_agent_calling_llm", page=page_num, attempt=attempt, model=self._model)
+                raw_text, usage = await self._call_llm(messages)
+                usage_logs.append({"stage": "VISION", "model": self._model, "provider": provider, **usage})
 
+                errors: list[str] = []
                 try:
                     parsed = json.loads(_clean_json(raw_text))
                     errors = _validate_vision_output(parsed)
-
-                    if not errors:
-                        log.info(
-                            "vision_agent_success",
-                            page=page_num,
-                            attempt=attempt,
-                        )
-                        page_results.append(parsed)
-                        break
-
-                    last_errors = errors
-                    last_raw = raw_text
-
                 except json.JSONDecodeError as e:
-                    last_errors = [f"Response is not valid JSON: {e}"]
-                    last_raw = raw_text
+                    errors = [f"Response is not valid JSON: {e}"]
+
+                conversation.append({
+                    "round": attempt,
+                    "page": page_num,
+                    "correction_sent": correction_text,
+                    "raw_response": raw_text,
+                    "errors": errors,
+                    "success": not bool(errors),
+                })
+
+                if not errors:
+                    log.info("vision_agent_success", page=page_num, attempt=attempt)
+                    page_results.append(parsed)
+                    break
 
                 if attempt < self._max_iterations:
-                    correction_prompt = (
-                        f"Your previous output was invalid. Errors:\n"
-                        + "\n".join(f"  - {e}" for e in last_errors)
-                        + f"\n\nYour previous output was:\n{last_raw}\n\n"
-                        "Please correct the JSON and return the full valid response."
+                    correction_text = (
+                        "Your output had these validation errors:\n"
+                        + "\n".join(f"  - {e}" for e in errors)
+                        + "\n\nPlease correct the JSON and return the full valid response."
                     )
-                    log.warning(
-                        "vision_agent_correction",
-                        page=page_num,
-                        attempt=attempt,
-                        errors=last_errors,
-                    )
+                    # Extend the conversation: LLM sees its own bad output as assistant,
+                    # then receives the correction as a new user turn.
+                    messages.append({"role": "assistant", "content": raw_text})
+                    messages.append({"role": "user", "content": correction_text})
+                    log.warning("vision_agent_correction", page=page_num, attempt=attempt, errors=errors)
                 else:
-                    # All attempts exhausted
-                    log.error(
-                        "vision_agent_failed_all_attempts",
-                        page=page_num,
-                        errors=last_errors,
-                    )
-                    raise RuntimeError(
+                    log.error("vision_agent_failed_all_attempts", page=page_num, errors=errors)
+                    raise AgentExhaustedError(
                         f"Vision agent failed after {self._max_iterations} attempts "
-                        f"on page {page_num}: {last_errors}"
+                        f"on page {page_num}: {errors}",
+                        conversation,
                     )
 
         # Merge multi-page results into a single output
         merged = self._merge_pages(page_results)
         final = _compute_derived_fields(merged)
-        return final, usage_logs
+        return final, usage_logs, conversation
 
     def _merge_pages(self, page_results: list[dict]) -> dict:
         """

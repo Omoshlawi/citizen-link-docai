@@ -28,22 +28,12 @@ class ProcessingService:
         3. Return the job UUID so NestJS can poll /v1/jobs/{id} if needed.
         """
         job_id = await self._repo.create_job(
-            external_case_id=request.external_case_id,
-            external_document_id=request.external_document_id,
-            external_extraction_id=request.external_extraction_id,
-            external_user_id=request.external_user_id,
-            case_type=request.case_type,
             case_number=request.case_number,
             image_urls=request.image_urls,
             webhook_url=request.webhook_url,
         )
 
-        log.info(
-            "job_created",
-            job_id=job_id,
-            external_case_id=request.external_case_id,
-            case_type=request.case_type,
-        )
+        log.info("job_created", job_id=job_id, case_number=request.case_number)
 
         # Enqueue the first pipeline stage
         redis_settings = RedisSettings.from_dsn(self._settings.redis_url)

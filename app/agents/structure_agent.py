@@ -15,6 +15,7 @@ from typing import Any, Optional
 import structlog
 from openai import AsyncOpenAI
 
+from app.agents.exceptions import AgentExhaustedError
 from app.config import Settings
 
 log = structlog.get_logger(__name__)
@@ -279,26 +280,15 @@ class StructureAgent:
             api_key=settings.structure_ai_api_key,
         )
 
-    async def _call_llm(
-        self,
-        prompt: str,
-        correction_prompt: Optional[str] = None,
-    ) -> tuple[str, dict]:
+    async def _call_llm(self, messages: list[dict]) -> tuple[str, dict]:
         """
-        Call the structure LLM. On correction rounds, prepend the error context.
-        Returns (raw_text, usage_dict).
+        Send the current conversation to the structure LLM and return (raw_text, usage).
+        `messages` grows across rounds: system → user → assistant → user → ...
         """
-        user_content = prompt
-        if correction_prompt:
-            user_content = correction_prompt + "\n\n" + prompt
-
         start = time.perf_counter()
         response = await self._client.chat.completions.create(
             model=self._model,
-            messages=[
-                {"role": "system", "content": STRUCTURE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
+            messages=messages,
             temperature=0.2,
             max_tokens=4096,
         )
@@ -316,7 +306,7 @@ class StructureAgent:
         self,
         vision_output: dict,
         document_types: Optional[list[dict]] = None,
-    ) -> tuple[dict, list[dict]]:
+    ) -> tuple[dict, list[dict], list[dict]]:
         """
         Run structure extraction using vision output as context.
 
@@ -326,74 +316,72 @@ class StructureAgent:
                            (defaults to all known codes if not provided)
 
         Returns:
-            (result, usage_logs) where:
-              result     — validated structure output dict
-              usage_logs — list of per-call usage dicts for ai_usage_logs table
+            (result, usage_logs, conversation) where:
+              result       — validated structure output dict
+              usage_logs   — list of per-call usage dicts (aggregated by tasks into processing_stages.usage)
+              conversation — list of correction-round records for audit/debugging
         """
         if document_types is None:
             document_types = [{"code": c} for c in DOCUMENT_TYPE_CODES]
 
+        provider = (
+            "ollama"
+            if "ollama" in self._model.lower() or "11434" in str(self._client.base_url)
+            else "openai"
+        )
         prompt = _build_user_prompt(vision_output, document_types)
+
+        # Build the conversation history for this extraction.
+        # Each failed round appends: assistant (bad output) → user (correction).
+        # The LLM therefore sees its own prior attempts in the assistant role.
+        messages: list[dict] = [
+            {"role": "system", "content": STRUCTURE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        correction_text: Optional[str] = None  # recorded for the conversation trail
         usage_logs: list[dict] = []
-        correction_prompt: Optional[str] = None
-        last_raw: Optional[str] = None
-        last_errors: list[str] = []
+        conversation: list[dict] = []
 
         for attempt in range(1, self._max_iterations + 1):
-            log.info(
-                "structure_agent_calling_llm",
-                attempt=attempt,
-                model=self._model,
-            )
-            raw_text, usage = await self._call_llm(prompt, correction_prompt)
-            usage_logs.append(
-                {
-                    "stage": "TEXT",
-                    "model": self._model,
-                    "provider": "ollama"
-                    if "ollama" in self._model.lower() or "11434" in str(self._client.base_url)
-                    else "openai",
-                    **usage,
-                    "success": True,
-                }
-            )
+            log.info("structure_agent_calling_llm", attempt=attempt, model=self._model)
+            raw_text, usage = await self._call_llm(messages)
+            usage_logs.append({"stage": "TEXT", "model": self._model, "provider": provider, **usage})
 
+            errors: list[str] = []
             try:
                 parsed = json.loads(_clean_json(raw_text))
                 errors = _validate_structure_output(parsed)
-
-                if not errors:
-                    log.info("structure_agent_success", attempt=attempt)
-                    return _sanitize_output(parsed), usage_logs
-
-                last_errors = errors
-                last_raw = raw_text
-
             except json.JSONDecodeError as e:
-                last_errors = [f"Response is not valid JSON: {e}"]
-                last_raw = raw_text
+                errors = [f"Response is not valid JSON: {e}"]
+
+            conversation.append({
+                "round": attempt,
+                "correction_sent": correction_text,
+                "raw_response": raw_text,
+                "errors": errors,
+                "success": not bool(errors),
+            })
+
+            if not errors:
+                log.info("structure_agent_success", attempt=attempt)
+                return _sanitize_output(parsed), usage_logs, conversation
 
             if attempt < self._max_iterations:
-                correction_prompt = (
-                    f"Your previous output was invalid. Errors:\n"
-                    + "\n".join(f"  - {e}" for e in last_errors)
-                    + f"\n\nYour previous output was:\n{last_raw}\n\n"
-                    "Please correct the JSON and return the full valid response."
+                correction_text = (
+                    "Your output had these validation errors:\n"
+                    + "\n".join(f"  - {e}" for e in errors)
+                    + "\n\nPlease correct the JSON and return the full valid response."
                 )
-                log.warning(
-                    "structure_agent_correction",
-                    attempt=attempt,
-                    errors=last_errors,
-                )
+                # Extend the conversation: LLM sees its own bad output as assistant,
+                # then receives the correction as a new user turn.
+                messages.append({"role": "assistant", "content": raw_text})
+                messages.append({"role": "user", "content": correction_text})
+                log.warning("structure_agent_correction", attempt=attempt, errors=errors)
             else:
-                log.error(
-                    "structure_agent_failed_all_attempts",
-                    errors=last_errors,
-                )
-                raise RuntimeError(
-                    f"Structure agent failed after {self._max_iterations} attempts: "
-                    f"{last_errors}"
+                log.error("structure_agent_failed_all_attempts", errors=errors)
+                raise AgentExhaustedError(
+                    f"Structure agent failed after {self._max_iterations} attempts: {errors}",
+                    conversation,
                 )
 
-        # Should never reach here
-        raise RuntimeError("Structure agent loop exited without returning")
+        raise AgentExhaustedError("Structure agent loop exited without returning", conversation)
