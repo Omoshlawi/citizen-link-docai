@@ -385,3 +385,22 @@ class StructureAgent:
                 )
 
         raise AgentExhaustedError("Structure agent loop exited without returning", conversation)
+
+    async def run(
+        self,
+        job_input: dict,
+        previous_results: dict[str, dict],
+    ) -> tuple[dict, list[dict], list[dict]]:
+        """
+        Unified agent interface called by the generic run_stage task.
+
+        Pulls the VISION stage result from previous_results and delegates
+        to extract().  job_input is unused by this stage.
+        """
+        vision_result = previous_results.get("VISION")
+        if not vision_result:
+            raise RuntimeError(
+                "VISION stage result not found in previous_results — "
+                "STRUCTURE cannot run without it"
+            )
+        return await self.extract(vision_result)

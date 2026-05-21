@@ -287,6 +287,24 @@ class VisionAgent:
         final = _compute_derived_fields(merged)
         return final, usage_logs, conversation
 
+    async def run(
+        self,
+        job_input: dict,
+        previous_results: dict[str, dict],
+    ) -> tuple[dict, list[dict], list[dict]]:
+        """
+        Unified agent interface called by the generic run_stage task.
+
+        Extracts image_urls from job_input and delegates to extract().
+        previous_results is unused by the vision stage (it is always first).
+        """
+        image_urls: list[str] = job_input.get("image_urls", [])
+        if not image_urls:
+            raise ValueError(
+                "job_input must contain a non-empty 'image_urls' list for VISION stage"
+            )
+        return await self.extract(image_urls)
+
     def _merge_pages(self, page_results: list[dict]) -> dict:
         """
         Merge vision output from multiple images (pages) into a single output dict.

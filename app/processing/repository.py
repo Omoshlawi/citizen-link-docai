@@ -4,6 +4,7 @@ ProcessingRepository — raw SQL operations on the processing_jobs table.
 All queries use asyncpg directly — no ORM.
 """
 
+import json
 from typing import List, Optional, Tuple
 
 import asyncpg
@@ -18,20 +19,22 @@ class ProcessingRepository:
 
     async def create_job(
         self,
-        case_number: str,
-        image_urls: list[str],
+        job_type: str,
+        input: dict,
         webhook_url: str,
+        priority: int = 5,
     ) -> str:
         """Insert a new PENDING job and return its UUID."""
         row = await self._pool.fetchrow(
             """
-            INSERT INTO processing_jobs (case_number, image_urls, webhook_url, status)
-            VALUES ($1, $2, $3, 'PENDING')
+            INSERT INTO processing_jobs (job_type, input, webhook_url, priority, status)
+            VALUES ($1, $2::jsonb, $3, $4, 'PENDING')
             RETURNING id::text
             """,
-            case_number,
-            image_urls,
+            job_type,
+            json.dumps(input),
             webhook_url,
+            priority,
         )
         return row["id"]
 
@@ -44,21 +47,29 @@ class ProcessingRepository:
 
     async def list_jobs(
         self,
+        job_type: Optional[str] = None,
         status: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Tuple[List[asyncpg.Record], int]:
         """
-        Return a paginated list of jobs and the total count.
-        Optionally filter by status (PENDING, IN_PROGRESS, COMPLETED, FAILED).
+        Return a paginated list of jobs and the total count, newest first.
+
+        Both job_type and status filters are optional and combinable.
         """
         offset = (page - 1) * page_size
+        conditions: list[str] = []
         params: list = []
-        where = ""
+
+        if job_type:
+            params.append(job_type)
+            conditions.append(f"job_type = ${len(params)}")
 
         if status:
             params.append(status)
-            where = "WHERE status = $1"
+            conditions.append(f"status = ${len(params)}")
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
         rows = await self._pool.fetch(
             f"""

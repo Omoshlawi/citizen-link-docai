@@ -19,7 +19,7 @@ import asyncpg
 import httpx
 import structlog
 
-from app.pipeline.enums import WebhookStage, WebhookStatus
+from app.pipeline.enums import WebhookStatus
 
 log = structlog.get_logger(__name__)
 
@@ -59,7 +59,7 @@ async def _log_delivery(
 async def deliver_webhook(
     pool: asyncpg.Pool,
     job_id: str,
-    stage: WebhookStage,
+    stage: str,
     status: WebhookStatus,
     callback_url: str,
     callback_secret: str,
@@ -74,7 +74,7 @@ async def deliver_webhook(
     """
     payload = {
         "jobId": job_id,
-        "stage": stage.value,
+        "stage": stage,
         "status": status.value,
         "result": result,
         "timestamp": datetime.now(timezone.utc).isoformat(),

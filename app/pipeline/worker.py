@@ -18,8 +18,7 @@ from arq.connections import RedisSettings
 from app.config import get_settings
 from app.database import create_pool, close_pool
 from app.pipeline.tasks import (
-    run_vision,
-    run_structure,
+    run_stage,
     task_deliver_webhook,
 )
 
@@ -56,8 +55,7 @@ class WorkerSettings:
     """
 
     functions = [
-        run_vision,
-        run_structure,
+        run_stage,
         task_deliver_webhook,
     ]
 

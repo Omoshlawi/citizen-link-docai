@@ -1,16 +1,16 @@
 """
-ARQ pipeline tasks — 2 stages + webhook delivery.
+ARQ pipeline tasks — generic stage runner + webhook delivery.
 
-Pipeline flow:
-  run_vision → run_structure
+Pipeline flow (EXTRACTION):
+  run_stage("VISION") → run_stage("STRUCTURE")
 
 Caller webhook contract:
   VISION    — OCR complete, extraction in progress (progress signal, no result data)
   COMPLETED — all extraction done, full fields delivered (terminal signal)
   FAILED    — a stage failed, includes which stage and the reason
 
-Future stages (fraud detection, quality scoring, etc.) slot between
-run_structure and the COMPLETED signal without any caller contract changes.
+New pipelines (fraud detection, match verification, etc.) register in
+app/pipeline/registry.py and slot in automatically — no changes needed here.
 
 Embedding is NOT part of this pipeline. The caller calls POST /v1/embed
 with confirmed, human-verified data after the user reviews extracted fields.
@@ -26,10 +26,8 @@ import asyncpg
 import structlog
 
 from app.agents.exceptions import AgentExhaustedError
-from app.agents.structure_agent import StructureAgent
-from app.agents.vision_agent import VisionAgent
 from app.config import Settings
-from app.pipeline.enums import WebhookStage, WebhookStatus
+from app.pipeline.enums import WebhookStatus
 from app.pipeline.webhook import deliver_webhook
 from app.processing.repository import ProcessingRepository
 
@@ -197,7 +195,7 @@ async def _notify_failure(
         pool=pool,
         settings=settings,
         job_id=job_id,
-        stage=WebhookStage.FAILED,
+        stage="FAILED",
         status=WebhookStatus.FAILED,
         callback_url=job_row["webhook_url"],
         result={"failedAt": failed_at, "reason": reason},
@@ -208,7 +206,7 @@ async def _enqueue_webhook(
     pool: asyncpg.Pool,
     settings: Settings,
     job_id: str,
-    stage: WebhookStage,
+    stage: str,
     status: WebhookStatus,
     callback_url: str,
     result: Optional[dict] = None,
@@ -229,29 +227,35 @@ async def _enqueue_webhook(
     await arq_pool.close()
 
 
-async def _enqueue_next(settings: Settings, task_name: str, job_id: str) -> None:
+async def _enqueue_next(settings: Settings, task_name: str, *args) -> None:
+    """Enqueue an ARQ task with arbitrary positional args."""
     from arq import create_pool as arq_create_pool
     from arq.connections import RedisSettings
 
     arq_pool = await arq_create_pool(RedisSettings.from_dsn(settings.redis_url))
-    await arq_pool.enqueue_job(task_name, job_id)
+    await arq_pool.enqueue_job(task_name, *args)
     await arq_pool.close()
 
 
-# ── Stage 1: Vision ────────────────────────────────────────────────────────────
+# ── Generic stage runner ───────────────────────────────────────────────────────
 
-async def run_vision(ctx: dict, job_id: str) -> None:
+async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
     """
-    Stage 1 — OCR extraction from document images.
+    Generic ARQ task — runs one pipeline stage for any job type.
 
-    Downloads images via pre-signed URLs, runs VisionAgent (call → validate →
-    auto-correct up to MAX_AGENT_ITERATIONS rounds), stores the OCR output,
-    sends a VISION progress webhook, then enqueues run_structure.
+    Dispatches to the correct agent via the pipeline registry, stores the
+    result, fires a progress webhook if this is a mid-pipeline stage, then
+    either enqueues the next stage or fires the terminal COMPLETED webhook.
+
+    Adding a new pipeline (fraud detection, match verification, etc.) requires
+    only a registry entry — this task never needs to change.
     """
+    from app.pipeline.registry import get_agent, get_pipeline
+
     pool: asyncpg.Pool = ctx["pool"]
     settings: Settings = ctx["settings"]
 
-    structlog.contextvars.bind_contextvars(job_id=job_id, stage="VISION")
+    structlog.contextvars.bind_contextvars(job_id=job_id, stage=stage)
     log.info("stage_started")
 
     repo = ProcessingRepository(pool)
@@ -260,127 +264,92 @@ async def run_vision(ctx: dict, job_id: str) -> None:
         log.error("job_not_found")
         return
 
-    await repo.update_status(job_id, "IN_PROGRESS", current_stage="VISION")
+    await repo.update_status(job_id, "IN_PROGRESS", current_stage=stage)
     started_at = datetime.now(timezone.utc)
 
+    job_type: str = job["job_type"]
+    # asyncpg returns JSONB as a Python dict; guard for str fallback just in case
+    raw_input = job["input"]
+    job_input: dict = (
+        json.loads(raw_input) if isinstance(raw_input, str) else dict(raw_input)
+    )
+
     try:
-        agent = VisionAgent(settings)
-        result, usage_logs, conversation = await agent.extract(list(job["image_urls"]))
+        pipeline = get_pipeline(job_type)
+        stage_index = pipeline.stages.index(stage)
+
+        # Collect results from all stages that ran before this one
+        previous_results: dict[str, dict] = {}
+        for prev_stage in pipeline.stages[:stage_index]:
+            prev_result = await _get_stage_result(pool, job_id, prev_stage)
+            if prev_result is not None:
+                previous_results[prev_stage] = prev_result
+
+        # Run the agent
+        agent = get_agent(job_type, stage, settings)
+        result, usage_logs, conversation = await agent.run(job_input, previous_results)
 
         stage_id = await _store_stage(
-            pool, job_id, "VISION",
+            pool, job_id, stage,
             status="SUCCESS",
             result=result,
             usage=_build_usage(usage_logs),
             started_at=started_at,
         )
         await _store_conversation(pool, stage_id, job_id, conversation)
-        log.info("stage_completed", confidence=result.get("averageConfidence"))
+        log.info("stage_completed")
 
-        await _enqueue_webhook(
-            pool=pool, settings=settings, job_id=job_id,
-            stage=WebhookStage.VISION, status=WebhookStatus.IN_PROGRESS,
-            callback_url=job["webhook_url"],
-        )
-        await _enqueue_next(settings, "run_structure", job_id)
+        next_index = stage_index + 1
+        has_next = next_index < len(pipeline.stages)
+
+        # Fire a progress webhook only for mid-pipeline stages — i.e. stages
+        # that are marked as progress stages AND have a successor.  For a
+        # single-stage pipeline (or the final stage of any pipeline) the
+        # COMPLETED webhook below is sufficient; a redundant IN_PROGRESS
+        # webhook immediately before it would be confusing to the caller.
+        if stage in pipeline.progress_stages and has_next:
+            await _enqueue_webhook(
+                pool=pool, settings=settings, job_id=job_id,
+                stage=stage, status=WebhookStatus.IN_PROGRESS,
+                callback_url=job["webhook_url"],
+            )
+
+        if has_next:
+            # More stages to run — enqueue the next one
+            next_stage = pipeline.stages[next_index]
+            log.info("enqueueing_next_stage", next_stage=next_stage)
+            await _enqueue_next(settings, "run_stage", job_id, next_stage)
+        else:
+            # Final stage — build the terminal result and fire COMPLETED
+            all_results: dict[str, dict] = {**previous_results, stage: result}
+            final_result = pipeline.build_result(all_results)
+
+            await repo.update_status(job_id, "COMPLETED", current_stage=None)
+            await _enqueue_webhook(
+                pool=pool, settings=settings, job_id=job_id,
+                stage="COMPLETED", status=WebhookStatus.COMPLETED,
+                callback_url=job["webhook_url"],
+                result=final_result,
+            )
+            log.info("pipeline_completed", job_type=job_type)
 
     except AgentExhaustedError as exc:
         log.error("stage_failed", error=str(exc))
         stage_id = await _store_stage(
-            pool, job_id, "VISION",
+            pool, job_id, stage,
             status="FAILED", error=str(exc), started_at=started_at,
         )
         await _store_conversation(pool, stage_id, job_id, exc.conversation)
-        await _notify_failure(pool, settings, job_id, "VISION", str(exc), job)
+        await _notify_failure(pool, settings, job_id, stage, str(exc), job)
         raise
 
     except Exception as exc:
         log.error("stage_failed", error=str(exc))
         await _store_stage(
-            pool, job_id, "VISION",
+            pool, job_id, stage,
             status="FAILED", error=str(exc), started_at=started_at,
         )
-        await _notify_failure(pool, settings, job_id, "VISION", str(exc), job)
-        raise
-
-
-# ── Stage 2: Structure ─────────────────────────────────────────────────────────
-
-async def run_structure(ctx: dict, job_id: str) -> None:
-    """
-    Stage 2 — Structured field extraction from OCR output.
-
-    Runs StructureAgent (call → validate → auto-correct up to
-    MAX_AGENT_ITERATIONS rounds) to produce validated document fields.
-
-    On success: marks the job COMPLETED and sends the terminal COMPLETED
-    webhook with the full extraction result. The caller needs nothing else
-    from docai — embedding is their responsibility after user confirmation.
-    """
-    pool: asyncpg.Pool = ctx["pool"]
-    settings: Settings = ctx["settings"]
-
-    structlog.contextvars.bind_contextvars(job_id=job_id, stage="STRUCTURE")
-    log.info("stage_started")
-
-    repo = ProcessingRepository(pool)
-    job = await repo.get_job(job_id)
-    if not job:
-        log.error("job_not_found")
-        return
-
-    await repo.update_status(job_id, "IN_PROGRESS", current_stage="STRUCTURE")
-    started_at = datetime.now(timezone.utc)
-
-    try:
-        vision_result = await _get_stage_result(pool, job_id, "VISION")
-        if not vision_result:
-            raise RuntimeError("Vision result not found — cannot run structure stage")
-
-        agent = StructureAgent(settings)
-        result, usage_logs, conversation = await agent.extract(vision_result)
-        confidence = result.get("quality", {}).get("extractionConfidence")
-
-        stage_id = await _store_stage(
-            pool, job_id, "STRUCTURE",
-            status="SUCCESS",
-            result=result,
-            usage=_build_usage(usage_logs),
-            started_at=started_at,
-        )
-        await _store_conversation(pool, stage_id, job_id, conversation)
-        log.info("stage_completed", confidence=confidence)
-
-        await repo.update_status(job_id, "COMPLETED", current_stage=None)
-
-        await _enqueue_webhook(
-            pool=pool, settings=settings, job_id=job_id,
-            stage=WebhookStage.COMPLETED, status=WebhookStatus.COMPLETED,
-            callback_url=job["webhook_url"],
-            result={
-                "fields": result,
-                "ocrConfidence": vision_result.get("averageConfidence"),
-                "extractionConfidence": confidence,
-            },
-        )
-
-    except AgentExhaustedError as exc:
-        log.error("stage_failed", error=str(exc))
-        stage_id = await _store_stage(
-            pool, job_id, "STRUCTURE",
-            status="FAILED", error=str(exc), started_at=started_at,
-        )
-        await _store_conversation(pool, stage_id, job_id, exc.conversation)
-        await _notify_failure(pool, settings, job_id, "STRUCTURE", str(exc), job)
-        raise
-
-    except Exception as exc:
-        log.error("stage_failed", error=str(exc))
-        await _store_stage(
-            pool, job_id, "STRUCTURE",
-            status="FAILED", error=str(exc), started_at=started_at,
-        )
-        await _notify_failure(pool, settings, job_id, "STRUCTURE", str(exc), job)
+        await _notify_failure(pool, settings, job_id, stage, str(exc), job)
         raise
 
 
@@ -389,7 +358,7 @@ async def run_structure(ctx: dict, job_id: str) -> None:
 async def task_deliver_webhook(
     ctx: dict,
     job_id: str,
-    stage: WebhookStage,
+    stage: str,
     status: WebhookStatus,
     callback_url: str,
     callback_secret: str,

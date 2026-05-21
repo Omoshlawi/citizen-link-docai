@@ -1,8 +1,16 @@
 """
 Processing endpoint schemas.
 
-ProcessRequest  — payload NestJS sends when submitting an extraction job.
-JobStatusResponse — response from GET /v1/jobs/{job_id}.
+One request schema per pipeline type — each endpoint is fully typed so bad
+input is rejected at the HTTP boundary (422) rather than surfacing inside a
+worker at runtime.
+
+The internal job model (job_type + input JSONB) stays generic — adding a new
+pipeline only requires a new request schema + a new route, no DB migrations.
+
+JobStatusResponse — response from GET /v1/jobs/{job_id}
+ProcessResponse   — 202 body returned by all submission endpoints
+JobListResponse   — paginated response from GET /v1/jobs
 """
 
 from datetime import datetime
@@ -11,37 +19,74 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
-class ProcessRequest(BaseModel):
-    case_number: str = Field(..., description="Human-readable case reference — used for logging and image organisation")
+# ── Submission request schemas (one per pipeline type) ─────────────────────────
+
+class ExtractionRequest(BaseModel):
+    """
+    POST /v1/jobs/extraction — OCR + structured field extraction.
+
+    The caller (NestJS) generates pre-signed image URLs before calling docai.
+    The signature is embedded in each URL so docai can download via plain HTTP
+    with no credentials.
+    """
+    case_number: str = Field(
+        ...,
+        description="Human-readable case reference — used for logging and image organisation.",
+    )
     image_urls: list[str] = Field(
         ...,
         min_length=1,
-        description=(
-            "Pre-signed MinIO URLs for the document images. "
-            "The caller generates these before calling docai — the signature is "
-            "embedded in the URL so docai downloads via plain HTTP with no credentials."
-        ),
+        description="Pre-signed MinIO URLs for the document images, in page order.",
     )
     webhook_url: str = Field(
         ...,
         description="Caller's webhook URL — docai POSTs stage callbacks here.",
     )
+    priority: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Job priority (1 = highest, 10 = lowest). Default 5.",
+    )
+
+
+# ── Future pipeline schemas slot in here:
+#
+# class FraudCheckRequest(BaseModel):
+#     """POST /v1/jobs/fraud-check"""
+#     document_id: str
+#     extraction_job_id: str
+#     webhook_url: str
+#     priority: int = Field(default=5, ge=1, le=10)
+#
+# class MatchVerificationRequest(BaseModel):
+#     """POST /v1/jobs/match-verification"""
+#     claim_id: str
+#     candidate_ids: list[str] = Field(..., min_length=1)
+#     webhook_url: str
+#     priority: int = Field(default=5, ge=1, le=10)
+
+
+# ── Shared response schemas ────────────────────────────────────────────────────
+
+class ProcessResponse(BaseModel):
+    """202 response body — returned by all job submission endpoints."""
+    job_id: str = Field(..., description="UUID of the queued pipeline job.")
 
 
 class JobStatusResponse(BaseModel):
+    """Single-job status — returned by GET /v1/jobs/{job_id}."""
     job_id: str
-    case_number: str
+    job_type: str
+    priority: int
     status: str
     current_stage: Optional[str]
     created_at: datetime
     updated_at: datetime
 
 
-class ProcessResponse(BaseModel):
-    job_id: str = Field(..., description="UUID of the queued extraction job")
-
-
 class JobListResponse(BaseModel):
+    """Paginated job list — returned by GET /v1/jobs."""
     jobs: List[JobStatusResponse]
     total: int
     page: int
