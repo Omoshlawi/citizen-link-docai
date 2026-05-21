@@ -49,7 +49,7 @@ class ProcessingService:
         redis_settings = RedisSettings.from_dsn(self._settings.redis_url)
         arq_pool = await arq_create_pool(redis_settings)
         await arq_pool.enqueue_job("run_vision", job_id)
-        await arq_pool.aclose()
+        await arq_pool.close()
 
         log.info("pipeline_enqueued", job_id=job_id, stage="VISION")
         return job_id

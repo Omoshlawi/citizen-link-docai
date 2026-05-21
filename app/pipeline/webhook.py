@@ -1,9 +1,9 @@
 """
-WebhookDelivery — sends stage callbacks to NestJS and logs every attempt.
+WebhookDelivery — sends stage callbacks to the caller and logs every attempt.
 
-This module is called from within ARQ tasks (deliver_webhook task).
+This module is called from within ARQ tasks (task_deliver_webhook).
 It does NOT make direct HTTP calls from pipeline stages — the stages enqueue
-a deliver_webhook ARQ task, which calls this module. This enables:
+a task_deliver_webhook ARQ task, which calls this module. This enables:
   - Automatic retry on failure (ARQ retries the task)
   - Manual re-enqueue for debugging
   - Full audit trail in webhook_deliveries table
@@ -27,7 +27,7 @@ async def _log_delivery(
     job_id: str,
     stage: str,
     payload: dict,
-    nestjs_url: str,
+    callback_url: str,
     response_status: Optional[int],
     response_body: Optional[str],
     attempt_count: int,
@@ -37,7 +37,7 @@ async def _log_delivery(
     await pool.execute(
         """
         INSERT INTO webhook_deliveries (
-            job_id, stage, payload, nestjs_url,
+            job_id, stage, payload, callback_url,
             response_status, response_body,
             attempt_count, delivered
         )
@@ -46,7 +46,7 @@ async def _log_delivery(
         job_id,
         stage,
         json.dumps(payload),
-        nestjs_url,
+        callback_url,
         response_status,
         response_body,
         attempt_count,
@@ -61,13 +61,13 @@ async def deliver_webhook(
     external_extraction_id: str,
     stage: str,
     status: str,
-    nestjs_url: str,
-    nestjs_secret: str,
+    callback_url: str,
+    callback_secret: str,
     result: Optional[dict] = None,
     attempt_count: int = 1,
 ) -> None:
     """
-    POST a stage callback to NestJS.
+    POST a stage callback to the caller's webhook URL.
 
     Raises on HTTP error so ARQ can retry the task automatically.
     Every attempt (success or failure) is logged to webhook_deliveries.
@@ -89,10 +89,10 @@ async def deliver_webhook(
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
-                nestjs_url,
+                callback_url,
                 json=payload,
                 headers={
-                    "X-Internal-Secret": nestjs_secret,
+                    "X-Internal-Secret": callback_secret,
                     "Content-Type": "application/json",
                 },
             )
@@ -136,7 +136,7 @@ async def deliver_webhook(
                 job_id=job_id,
                 stage=stage,
                 payload=payload,
-                nestjs_url=nestjs_url,
+                callback_url=callback_url,
                 response_status=response_status,
                 response_body=response_body,
                 attempt_count=attempt_count,

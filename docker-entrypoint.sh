@@ -13,8 +13,8 @@ if [ -z "$INTERNAL_SECRET" ]; then
   exit 1
 fi
 
-if [ -z "$NESTJS_WEBHOOK_URL" ]; then
-  echo "❌ NESTJS_WEBHOOK_URL is not set. Exiting."
+if [ -z "$CALLBACK_URL" ]; then
+  echo "❌ CALLBACK_URL is not set. Exiting."
   exit 1
 fi
 

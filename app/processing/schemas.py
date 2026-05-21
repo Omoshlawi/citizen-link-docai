@@ -12,10 +12,10 @@ from pydantic import BaseModel, Field
 
 
 class ProcessRequest(BaseModel):
-    external_case_id: str = Field(..., description="NestJS DocumentCase.id")
-    external_document_id: str = Field(..., description="NestJS Document.id")
-    external_extraction_id: str = Field(..., description="NestJS AIExtraction.id")
-    external_user_id: str = Field(..., description="NestJS User.id (case owner)")
+    external_case_id: str = Field(..., description="Caller's case entity ID")
+    external_document_id: str = Field(..., description="Caller's document entity ID")
+    external_extraction_id: str = Field(..., description="Caller's extraction entity ID")
+    external_user_id: str = Field(..., description="Caller's user ID (case owner)")
     case_type: str = Field(..., description="'LOST' or 'FOUND'")
     case_number: str = Field(..., description="Human-readable case reference")
     image_urls: list[str] = Field(
@@ -29,7 +29,7 @@ class ProcessRequest(BaseModel):
     )
     webhook_url: str = Field(
         ...,
-        description="NestJS URL to POST stage callbacks to (overrides env default for multi-tenant)",
+        description="Caller's webhook URL — docai POSTs stage callbacks here.",
     )
 
 

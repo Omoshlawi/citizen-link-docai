@@ -24,11 +24,11 @@ class Settings(BaseSettings):
     # NestJS sends it in X-Internal-Secret header so we know the request is legit.
     internal_secret: str
 
-    # ── NestJS Webhook ─────────────────────────────────────────────────────────
-    # Where docai sends stage-completion callbacks.
-    nestjs_webhook_url: str
-    # Secret docai sends to NestJS so it can validate our callbacks.
-    nestjs_internal_secret: str
+    # ── Callback (webhook sent by docai after each pipeline stage) ────────────
+    # URL of the caller's webhook receiver — docai POSTs stage updates here.
+    callback_url: str
+    # Secret docai sends on every callback so the caller can validate the request.
+    callback_secret: str
 
     # ── Vision Model ───────────────────────────────────────────────────────────
     vision_ai_base_url: str = "http://localhost:11434/v1"

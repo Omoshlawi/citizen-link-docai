@@ -5,10 +5,10 @@ Revises: —
 Create Date: 2025-01-01 00:00:00.000000
 
 Tables:
-  processing_jobs      — job tracking (opaque references to NestJS entities)
+  processing_jobs      — job tracking (opaque references to caller's entities)
   extraction_results   — per-stage AI output (VISION / TEXT / EMBEDDING)
   ai_usage_logs        — every model call logged with tokens, cost, latency
-  webhook_deliveries   — audit trail for every callback sent to NestJS
+  webhook_deliveries   — audit trail for every callback sent to the caller
 """
 
 from alembic import op
@@ -93,7 +93,7 @@ def upgrade() -> None:
             job_id          UUID NOT NULL REFERENCES processing_jobs(id) ON DELETE CASCADE,
             stage           TEXT NOT NULL,
             payload         JSONB NOT NULL,
-            nestjs_url      TEXT NOT NULL,
+            callback_url      TEXT NOT NULL,
             response_status INT,
             response_body   TEXT,
             attempt_count   INT NOT NULL DEFAULT 1,

@@ -55,7 +55,7 @@ async def _fail_job(
         external_extraction_id=job_row["external_extraction_id"],
         stage="FAILED",
         status="failed",
-        nestjs_url=job_row["webhook_url"],
+        callback_url=job_row["webhook_url"],
         result={"failedAt": failed_at, "reason": reason},
     )
 
@@ -100,7 +100,7 @@ async def _enqueue_webhook(
     external_extraction_id: str,
     stage: str,
     status: str,
-    nestjs_url: str,
+    callback_url: str,
     result: Optional[dict] = None,
 ) -> None:
     """Enqueue a deliver_webhook ARQ task."""
@@ -116,11 +116,11 @@ async def _enqueue_webhook(
         external_extraction_id,
         stage,
         status,
-        nestjs_url,
-        settings.nestjs_internal_secret,
+        callback_url,
+        settings.callback_secret,
         result,
     )
-    await arq_pool.aclose()
+    await arq_pool.close()
 
 
 async def _enqueue_next(settings: Settings, task_name: str, job_id: str) -> None:
@@ -131,7 +131,7 @@ async def _enqueue_next(settings: Settings, task_name: str, job_id: str) -> None
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     arq_pool = await arq_create_pool(redis_settings)
     await arq_pool.enqueue_job(task_name, job_id)
-    await arq_pool.aclose()
+    await arq_pool.close()
 
 
 # ── Stage 1: Vision ────────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ async def run_vision(ctx: dict, job_id: str) -> None:
             external_extraction_id=job["external_extraction_id"],
             stage="VISION",
             status="completed",
-            nestjs_url=job["webhook_url"],
+            callback_url=job["webhook_url"],
         )
 
         # Kick off next stage
@@ -234,7 +234,7 @@ async def run_structure(ctx: dict, job_id: str) -> None:
             external_extraction_id=job["external_extraction_id"],
             stage="TEXT",
             status="completed",
-            nestjs_url=job["webhook_url"],
+            callback_url=job["webhook_url"],
             result=result,
         )
 
@@ -317,7 +317,7 @@ async def run_embedding(ctx: dict, job_id: str) -> None:
             external_extraction_id=job["external_extraction_id"],
             stage="EMBEDDING",
             status="completed",
-            nestjs_url=job["webhook_url"],
+            callback_url=job["webhook_url"],
         )
 
         await _enqueue_next(settings, "run_post_processing", job_id)
@@ -379,7 +379,7 @@ async def run_post_processing(ctx: dict, job_id: str) -> None:
             external_extraction_id=job["external_extraction_id"],
             stage="COMPLETED",
             status="completed",
-            nestjs_url=job["webhook_url"],
+            callback_url=job["webhook_url"],
             result=final_result,
         )
 
@@ -398,8 +398,8 @@ async def task_deliver_webhook(
     external_extraction_id: str,
     stage: str,
     status: str,
-    nestjs_url: str,
-    nestjs_secret: str,
+    callback_url: str,
+    callback_secret: str,
     result: Optional[dict] = None,
 ) -> None:
     """
@@ -421,8 +421,8 @@ async def task_deliver_webhook(
         external_extraction_id=external_extraction_id,
         stage=stage,
         status=status,
-        nestjs_url=nestjs_url,
-        nestjs_secret=nestjs_secret,
+        callback_url=callback_url,
+        callback_secret=callback_secret,
         result=result,
         attempt_count=attempt,
     )
