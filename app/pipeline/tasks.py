@@ -234,6 +234,17 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
         next_index = stage_index + 1
         has_next = next_index < len(pipeline.stages)
 
+        # Post-stage gate — rule-based fast-fail before spending tokens on next stage.
+        # Only checked when a subsequent stage exists; the final stage is never gated.
+        if has_next:
+            gate = pipeline.post_stage_gate.get(stage)
+            if gate:
+                gate_error = gate(result_model.to_dict())
+                if gate_error:
+                    log.warning("stage_gate_failed", stage=stage, reason=gate_error)
+                    await _notify_failure(pool, settings, job_id, stage, gate_error, job)
+                    return  # expected business outcome — no retry, no exception
+
         if stage in pipeline.progress_stages and has_next:
             await _enqueue_webhook(
                 pool=pool, settings=settings, job_id=job_id,
