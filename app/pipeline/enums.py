@@ -31,3 +31,12 @@ class JobStatus(str, Enum):
 class PipelineStage(str, Enum):
     VISION = "VISION"
     STRUCTURE = "STRUCTURE"
+
+
+class JobType(str, Enum):
+    EXTRACTION = "EXTRACTION"
+
+
+class StageStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"

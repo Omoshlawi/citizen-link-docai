@@ -1,23 +1,25 @@
 """
-StructureAgent — vision output → validated structured document fields.
+StructureAgent — vision output → StructureOutput.
 
 Receives the raw text + visual element descriptions from VisionAgent and
 extracts typed, validated identity fields.  All interpretation happens here —
 VisionAgent deliberately does none.
-
-Output schema mirrors NestJS TextExtractionOutputSchema (extraction.dto.ts).
 """
+
+from __future__ import annotations
 
 import json
 import re
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import structlog
 from openai import AsyncOpenAI
 
 from app.agents.exceptions import AgentExhaustedError
 from app.config import Settings
+from app.models.pipeline import ConversationEntry, UsageEntry
+from app.models.structure import StructureOutput
 
 log = structlog.get_logger(__name__)
 
@@ -187,51 +189,40 @@ def _clean_json(text: str) -> str:
 
 def _validate_structure_output(data: dict) -> list[str]:
     """
-    Validate structure agent output. Returns a list of validation errors.
+    Validate structure agent output before constructing a StructureOutput.
+    Returns a list of human-readable error strings for the correction prompt.
     Empty list = valid.
     """
-    errors = []
+    errors: list[str] = []
 
-    # documentType
     doc_type = data.get("documentType")
     if not isinstance(doc_type, dict):
         errors.append("documentType must be an object")
     else:
-        code = doc_type.get("code")
-        if code not in DOCUMENT_TYPE_CODES:
-            errors.append(
-                f"documentType.code must be one of: {', '.join(DOCUMENT_TYPE_CODES)}"
-            )
+        if doc_type.get("code") not in DOCUMENT_TYPE_CODES:
+            errors.append(f"documentType.code must be one of: {', '.join(DOCUMENT_TYPE_CODES)}")
         conf = doc_type.get("confidence")
         if not isinstance(conf, (int, float)) or not (0 <= conf <= 1):
             errors.append("documentType.confidence must be a decimal in [0, 1]")
 
-    # person
     person = data.get("person")
     if not isinstance(person, dict):
         errors.append("person must be an object")
-    else:
-        gender = person.get("gender")
-        if gender not in ("Male", "Female", "Unknown"):
-            errors.append('person.gender must be "Male", "Female", or "Unknown"')
+    elif person.get("gender") not in ("Male", "Female", "Unknown"):
+        errors.append('person.gender must be "Male", "Female", or "Unknown"')
 
-    # document
     if not isinstance(data.get("document"), dict):
         errors.append("document must be an object")
 
-    # address
     address = data.get("address")
     if not isinstance(address, dict):
         errors.append("address must be an object")
-    else:
-        if not isinstance(address.get("components", []), list):
-            errors.append("address.components must be an array")
+    elif not isinstance(address.get("components", []), list):
+        errors.append("address.components must be an array")
 
-    # biometrics
     if not isinstance(data.get("biometrics"), dict):
         errors.append("biometrics must be an object")
 
-    # raw
     raw = data.get("raw")
     if not isinstance(raw, dict):
         errors.append("raw must be an object")
@@ -242,15 +233,14 @@ def _validate_structure_output(data: dict) -> list[str]:
         elif not all(isinstance(p, (int, float)) for p in pages_ref):
             errors.append("raw.pagesReferenced must contain only numbers")
 
-    # quality
     quality = data.get("quality")
     if not isinstance(quality, dict):
         errors.append("quality must be an object")
     else:
-        for field in ("ocrConfidence", "extractionConfidence"):
-            v = quality.get(field)
+        for f in ("ocrConfidence", "extractionConfidence"):
+            v = quality.get(f)
             if not isinstance(v, (int, float)) or not (0 <= v <= 1):
-                errors.append(f"quality.{field} must be a decimal in [0, 1]")
+                errors.append(f"quality.{f} must be a decimal in [0, 1]")
         warnings = quality.get("warnings", [])
         if not isinstance(warnings, list):
             errors.append("quality.warnings must be an array")
@@ -262,32 +252,28 @@ def _validate_structure_output(data: dict) -> list[str]:
     return errors
 
 
-def _sanitize_output(data: dict) -> dict:
+def _sanitize(data: dict) -> dict:
     """
-    Post-process the structure output:
-    - Ensure documentType.code is a valid enum (fallback to UNKNOWN)
-    - Round confidence values to 4 decimal places
-    - Filter warnings to only valid codes
-    - Ensure pagesReferenced contains integers
+    Fix edge cases before constructing StructureOutput:
+    - Coerce unknown documentType.code to UNKNOWN
+    - Round confidence values to 4dp
+    - Strip invalid warning codes
+    - Coerce pagesReferenced elements to int
     """
     doc_type = data.get("documentType", {})
     if doc_type.get("code") not in DOCUMENT_TYPE_CODES:
         doc_type["code"] = "UNKNOWN"
 
     quality = data.get("quality", {})
-    for field in ("ocrConfidence", "extractionConfidence"):
-        v = quality.get(field, 0)
+    for f in ("ocrConfidence", "extractionConfidence"):
+        v = quality.get(f, 0)
         if isinstance(v, (int, float)):
-            quality[field] = round(float(v), 4)
-
-    quality["warnings"] = [
-        w for w in quality.get("warnings", []) if w in VALID_WARNINGS
-    ]
+            quality[f] = round(float(v), 4)
+    quality["warnings"] = [w for w in quality.get("warnings", []) if w in VALID_WARNINGS]
 
     raw = data.get("raw", {})
     raw["pagesReferenced"] = [
-        int(p) for p in raw.get("pagesReferenced", [])
-        if isinstance(p, (int, float))
+        int(p) for p in raw.get("pagesReferenced", []) if isinstance(p, (int, float))
     ]
 
     return data
@@ -307,12 +293,6 @@ class StructureAgent:
         )
 
     async def _call_llm(self, messages: list[dict]) -> tuple[str, dict]:
-        """
-        Send the current conversation to the structure LLM.
-
-        messages grows across correction rounds:
-          system → user(vision output) → assistant(bad output) → user(correction) → …
-        """
         start = time.perf_counter()
         response = await self._client.chat.completions.create(
             model=self._model,
@@ -321,7 +301,6 @@ class StructureAgent:
             max_tokens=4096,
         )
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
-
         raw_text = response.choices[0].message.content or ""
         usage = {
             "input_tokens": response.usage.prompt_tokens if response.usage else None,
@@ -334,17 +313,16 @@ class StructureAgent:
         self,
         vision_output: dict,
         document_types: Optional[list[dict]] = None,
-    ) -> tuple[dict, list[dict], list[dict]]:
+    ) -> tuple[StructureOutput, list[UsageEntry], list[ConversationEntry]]:
         """
         Run structure extraction using vision output as context.
 
         Args:
-            vision_output: validated output from VisionAgent
-            document_types: list of {code} dicts for type classification
-                           (defaults to all known codes if not provided)
+            vision_output: plain dict from VisionAgent (or retrieved from DB JSONB)
+            document_types: list of {code} dicts — defaults to all known codes
 
         Returns:
-            (result, usage_logs, conversation)
+            (StructureOutput, usage_entries, conversation_entries)
         """
         if document_types is None:
             document_types = [{"code": c} for c in DOCUMENT_TYPE_CODES]
@@ -361,32 +339,42 @@ class StructureAgent:
             {"role": "user", "content": prompt},
         ]
         correction_text: Optional[str] = None
-        usage_logs: list[dict] = []
-        conversation: list[dict] = []
+        usage_entries: list[UsageEntry] = []
+        conversation: list[ConversationEntry] = []
 
         for attempt in range(1, self._max_iterations + 1):
             log.info("structure_agent_calling_llm", attempt=attempt, model=self._model)
-            raw_text, usage = await self._call_llm(messages)
-            usage_logs.append({"stage": "STRUCTURE", "model": self._model, "provider": provider, **usage})
+            raw_text, raw_usage = await self._call_llm(messages)
+
+            usage_entries.append(UsageEntry(
+                stage="STRUCTURE",
+                model=self._model,
+                provider=provider,
+                input_tokens=raw_usage["input_tokens"],
+                output_tokens=raw_usage["output_tokens"],
+                latency_ms=raw_usage["latency_ms"],
+            ))
 
             errors: list[str] = []
+            parsed: Optional[dict] = None
             try:
                 parsed = json.loads(_clean_json(raw_text))
                 errors = _validate_structure_output(parsed)
             except json.JSONDecodeError as e:
                 errors = [f"Response is not valid JSON: {e}"]
 
-            conversation.append({
-                "round": attempt,
-                "correction_sent": correction_text,
-                "raw_response": raw_text,
-                "errors": errors,
-                "success": not bool(errors),
-            })
+            conversation.append(ConversationEntry(
+                round=attempt,
+                correction_sent=correction_text,
+                raw_response=raw_text,
+                errors=errors,
+                success=not bool(errors),
+            ))
 
-            if not errors:
+            if not errors and parsed is not None:
                 log.info("structure_agent_success", attempt=attempt)
-                return _sanitize_output(parsed), usage_logs, conversation
+                sanitized = _sanitize(parsed)
+                return StructureOutput.model_validate(sanitized), usage_entries, conversation
 
             if attempt < self._max_iterations:
                 correction_text = (
@@ -410,12 +398,12 @@ class StructureAgent:
         self,
         job_input: dict,
         previous_results: dict[str, dict],
-    ) -> tuple[dict, list[dict], list[dict]]:
+    ) -> tuple[StructureOutput, list[UsageEntry], list[ConversationEntry]]:
         """
         Unified agent interface called by the generic run_stage task.
 
-        Pulls the VISION stage result from previous_results and delegates
-        to extract().  job_input is unused by this stage.
+        Pulls the VISION stage result (plain dict from DB JSONB) from
+        previous_results and delegates to extract().
         """
         vision_result = previous_results.get("VISION")
         if not vision_result:

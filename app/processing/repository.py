@@ -96,7 +96,10 @@ class ProcessingRepository:
         status: str,
         current_stage: Optional[str] = None,
     ) -> None:
-        """Update a job's status, optionally setting current_stage."""
+        """Update a job's status, optionally setting current_stage.
+
+        Accepts plain strings or JobStatus enum values (which are str subclasses).
+        """
         await self._pool.execute(
             """
             UPDATE processing_jobs

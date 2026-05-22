@@ -1,5 +1,5 @@
 """
-VisionAgent — image → raw text + visual element descriptions.
+VisionAgent — image → VisionOutput.
 
 Two focused jobs per page:
   1. Transcribe ALL text exactly as it appears (verbatim, no interpretation)
@@ -8,12 +8,11 @@ Two focused jobs per page:
 
 This deliberately unstructured output is designed to feed StructureAgent,
 which handles all interpretation and field extraction.  Keeping vision
-purely observational — no block IDs, no bboxes, no type enums — removes
-the main sources of LLM hallucination and schema correction loops.
-
-Output shape per page:
-  { pageNumber, confidence, text, visualElements: [str, ...] }
+purely observational removes the main sources of LLM hallucination and
+schema correction loops.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -28,6 +27,8 @@ from openai import AsyncOpenAI
 
 from app.agents.exceptions import AgentExhaustedError
 from app.config import Settings
+from app.models.pipeline import ConversationEntry, UsageEntry
+from app.models.vision import VisionMeta, VisionOutput, VisionPage
 
 log = structlog.get_logger(__name__)
 
@@ -84,7 +85,7 @@ OUTPUT SCHEMA (return exactly this, one object for the whole image):
 """
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Validation (operates on raw dict before model construction) ────────────────
 
 def _clean_json(text: str) -> str:
     """Strip markdown code fences if the model wraps output in them."""
@@ -96,13 +97,11 @@ def _clean_json(text: str) -> str:
 
 def _validate_vision_output(data: dict) -> list[str]:
     """
-    Validate the parsed vision output. Returns a list of errors.
+    Validate the parsed LLM output before constructing a VisionOutput.
+    Returns a list of human-readable error strings for the correction prompt.
     Empty list means valid.
-
-    Deliberately minimal — the model's only real jobs are transcribing text
-    and listing visual elements, so the schema has very few moving parts.
     """
-    errors = []
+    errors: list[str] = []
 
     meta = data.get("meta")
     if not isinstance(meta, dict):
@@ -117,11 +116,9 @@ def _validate_vision_output(data: dict) -> list[str]:
         for i, page in enumerate(pages):
             if not isinstance(page.get("text"), str):
                 errors.append(f"pages[{i}].text must be a string")
-
             conf = page.get("confidence")
             if not isinstance(conf, (int, float)) or not (0 <= conf <= 1):
                 errors.append(f"pages[{i}].confidence must be a decimal in [0, 1]")
-
             if not isinstance(page.get("visualElements"), list):
                 errors.append(f"pages[{i}].visualElements must be an array")
             else:
@@ -134,38 +131,24 @@ def _validate_vision_output(data: dict) -> list[str]:
     return errors
 
 
-def _compute_derived_fields(data: dict) -> dict:
+# ── Derived field computation (operates on VisionOutput in-place) ──────────────
+
+def _compute_derived_fields(output: VisionOutput) -> VisionOutput:
     """
-    Compute fullText and averageConfidence deterministically from page content.
+    Compute fullText and averageConfidence from the page models.
 
-    fullText       — all page texts joined with a newline, trimmed per page.
-    averageConfidence — mean of per-page confidence scores, rounded to 4dp.
-
-    Both are computed here rather than asked from the model — removes a source
-    of inconsistency and keeps the prompt simpler.
+    Both are deterministic — never asked from the LLM.
     """
-    pages = data.get("pages", [])
+    for page in output.pages:
+        page.text = page.text.strip()
 
-    # Trim page text in-place
-    for page in pages:
-        if isinstance(page.get("text"), str):
-            page["text"] = page["text"].strip()
+    output.fullText = "\n".join(page.text for page in output.pages)
 
-    full_text = "\n".join(page.get("text", "") for page in pages)
-
-    confidences = [
-        page["confidence"]
-        for page in pages
-        if isinstance(page.get("confidence"), (int, float))
-    ]
-    avg_conf = round(sum(confidences) / len(confidences), 4) if confidences else 0.0
-
-    return {
-        **data,
-        "fullText": full_text,
-        "averageConfidence": avg_conf,
-        "pages": pages,
-    }
+    confidences = [page.confidence for page in output.pages]
+    output.averageConfidence = (
+        round(sum(confidences) / len(confidences), 4) if confidences else 0.0
+    )
+    return output
 
 
 # ── Agent ──────────────────────────────────────────────────────────────────────
@@ -176,8 +159,8 @@ class VisionAgent:
 
     Pages are processed in parallel (asyncio.gather) so total latency is
     bounded by the slowest page, not the sum of all pages.  Each page has its
-    own isolated multi-turn conversation, so a correction on page 2 does not
-    affect page 1's context.
+    own isolated multi-turn conversation so corrections on page 2 never affect
+    page 1's context.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -219,8 +202,8 @@ class VisionAgent:
         """
         Send the current conversation to the vision LLM.
 
-        messages grows across correction rounds:
-          system → user(image) → assistant(bad output) → user(correction) → …
+        Returns (raw_text, usage_dict) — usage_dict is intentionally untyped
+        here since UsageEntry is constructed by the caller, which knows the stage.
         """
         start = time.perf_counter()
         response = await self._client.chat.completions.create(
@@ -244,11 +227,11 @@ class VisionAgent:
         page_num: int,
         url: str,
         provider: str,
-    ) -> tuple[dict, list[dict], list[dict]]:
+    ) -> tuple[VisionOutput, list[UsageEntry], list[ConversationEntry]]:
         """
         Run vision extraction for a single page.
 
-        Returns (page_result, usage_logs, conversation_entries).
+        Returns (page_output, usage_entries, conversation_entries).
         Raises AgentExhaustedError — carrying this page's conversation trail —
         if all correction attempts are exhausted.
         """
@@ -257,33 +240,42 @@ class VisionAgent:
 
         messages = self._build_initial_messages(image_bytes, mime_type)
         correction_text: Optional[str] = None
-        usage_logs: list[dict] = []
-        conversation: list[dict] = []
+        usage_entries: list[UsageEntry] = []
+        conversation: list[ConversationEntry] = []
 
         for attempt in range(1, self._max_iterations + 1):
             log.info("vision_agent_calling_llm", page=page_num, attempt=attempt, model=self._model)
-            raw_text, usage = await self._call_llm(messages)
-            usage_logs.append({"stage": "VISION", "model": self._model, "provider": provider, **usage})
+            raw_text, raw_usage = await self._call_llm(messages)
+
+            usage_entries.append(UsageEntry(
+                stage="VISION",
+                model=self._model,
+                provider=provider,
+                input_tokens=raw_usage["input_tokens"],
+                output_tokens=raw_usage["output_tokens"],
+                latency_ms=raw_usage["latency_ms"],
+            ))
 
             errors: list[str] = []
+            parsed: Optional[dict] = None
             try:
                 parsed = json.loads(_clean_json(raw_text))
                 errors = _validate_vision_output(parsed)
             except json.JSONDecodeError as e:
                 errors = [f"Response is not valid JSON: {e}"]
 
-            conversation.append({
-                "round": attempt,
-                "page": page_num,
-                "correction_sent": correction_text,
-                "raw_response": raw_text,
-                "errors": errors,
-                "success": not bool(errors),
-            })
+            conversation.append(ConversationEntry(
+                round=attempt,
+                page=page_num,
+                correction_sent=correction_text,
+                raw_response=raw_text,
+                errors=errors,
+                success=not bool(errors),
+            ))
 
-            if not errors:
+            if not errors and parsed is not None:
                 log.info("vision_agent_success", page=page_num, attempt=attempt)
-                return parsed, usage_logs, conversation
+                return VisionOutput.model_validate(parsed), usage_entries, conversation
 
             if attempt < self._max_iterations:
                 correction_text = (
@@ -309,18 +301,16 @@ class VisionAgent:
     async def extract(
         self,
         image_urls: list[str],
-    ) -> tuple[dict, list[dict], list[dict]]:
+    ) -> tuple[VisionOutput, list[UsageEntry], list[ConversationEntry]]:
         """
         Run vision extraction on all provided images in parallel.
 
         Total latency = slowest page (not sum of pages).
-        Per-page isolation is preserved: each page has its own conversation
-        history and correction loop.
 
         Returns:
-            result       — merged vision output with fullText + averageConfidence
-            usage_logs   — per-call usage dicts, ordered by page then round
-            conversation — correction-round records for all pages, ordered by page
+            output       — merged VisionOutput with fullText + averageConfidence
+            usage        — UsageEntry list, ordered page → round
+            conversation — ConversationEntry list, ordered page → round
         """
         provider = (
             "ollama"
@@ -334,48 +324,46 @@ class VisionAgent:
         ]
 
         try:
-            page_outputs: list[tuple[dict, list[dict], list[dict]]] = await asyncio.gather(*tasks)
+            page_outputs: list[tuple[VisionOutput, list[UsageEntry], list[ConversationEntry]]] = (
+                await asyncio.gather(*tasks)
+            )
         except AgentExhaustedError:
-            raise  # pipeline catches this and persists the conversation from exc.conversation
+            raise
 
         page_results, all_usage, all_conversations = zip(*page_outputs)
 
-        merged_usage = [entry for page_usage in all_usage for entry in page_usage]
-        merged_conversations = [entry for page_conv in all_conversations for entry in page_conv]
+        merged_usage = [e for page_usage in all_usage for e in page_usage]
+        merged_conversations = [e for page_conv in all_conversations for e in page_conv]
 
         merged = self._merge_pages(list(page_results))
         final = _compute_derived_fields(merged)
         return final, merged_usage, merged_conversations
 
-    def _merge_pages(self, page_results: list[dict]) -> dict:
+    def _merge_pages(self, page_results: list[VisionOutput]) -> VisionOutput:
         """
-        Merge single-page vision outputs into one multi-page dict.
-        Each call to _extract_page returns a full {meta, pages:[...]} object
-        for that image — this stitches them together and re-numbers pages.
+        Merge single-page VisionOutput objects into one multi-page VisionOutput.
+        Page numbers are re-assigned sequentially.
         """
         if len(page_results) == 1:
             return page_results[0]
 
-        all_pages = []
+        all_pages: list[VisionPage] = []
         for result in page_results:
-            all_pages.extend(result.get("pages", []))
+            all_pages.extend(result.pages)
 
         for i, page in enumerate(all_pages, start=1):
-            page["pageNumber"] = i
+            page.pageNumber = i
 
-        return {
-            "meta": {
-                "pageCount": len(all_pages),
-                "engine": "vision-llm",
-            },
-            "pages": all_pages,
-        }
+        return VisionOutput(
+            meta=VisionMeta(pageCount=len(all_pages), engine="vision-llm"),
+            pages=all_pages,
+        )
 
     async def run(
         self,
         job_input: dict,
         previous_results: dict[str, dict],
-    ) -> tuple[dict, list[dict], list[dict]]:
+    ) -> tuple[VisionOutput, list[UsageEntry], list[ConversationEntry]]:
         """
         Unified agent interface called by the generic run_stage task.
 
