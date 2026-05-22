@@ -32,6 +32,7 @@ from app.middleware import RequestIDMiddleware
 from app.health import router as health_router
 from app.processing.router import router as processing_router
 from app.embedding.router import router as embedding_router
+from app.inspection.router import router as inspection_router
 
 
 def configure_logging(log_level: str) -> None:
@@ -107,3 +108,4 @@ app.add_exception_handler(Exception, generic_error_handler)
 app.include_router(health_router)
 app.include_router(processing_router, prefix="/v1")
 app.include_router(embedding_router, prefix="/v1")
+app.include_router(inspection_router, prefix="/v1")

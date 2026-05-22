@@ -67,12 +67,14 @@ def _row_to_job(row) -> JobStatusResponse:
     summary="Submit an extraction job",
     description=(
         "Enqueue an OCR + structured field extraction pipeline for one or more "
-        "document images. Returns 202 immediately — the caller receives progress "
-        "via webhook callbacks as each stage completes.\n\n"
-        "**Webhook stages:**\n"
-        "- `VISION` (in_progress) — OCR complete, structure extraction starting\n"
-        "- `COMPLETED` (completed) — all fields extracted, full result delivered\n"
-        "- `FAILED` (failed) — a stage failed; includes which stage and the reason"
+        "document images. Returns 202 immediately — the caller receives event-based "
+        "webhook callbacks as each stage completes.\n\n"
+        "**Webhook events (dot-notation):**\n"
+        "- `extraction.vision.success` — OCR complete, raw vision output in result\n"
+        "- `extraction.structure.success` — field extraction complete, raw structure output\n"
+        "- `extraction.success` — terminal; nested `{ vision, structure }` combined result\n"
+        "- `extraction.vision.failed` / `extraction.structure.failed` — stage-specific failure\n"
+        "- `extraction.failed` — flat rollup failure; `{ failedAt, reason }`"
     ),
 )
 async def submit_extraction(
