@@ -1,8 +1,9 @@
 """
-StructureAgent — vision OCR output → validated structured document fields.
+StructureAgent — vision output → validated structured document fields.
 
-Calls the structure LLM with the vision output as context, validates against
-the expected schema, and auto-corrects up to MAX_AGENT_ITERATIONS rounds.
+Receives the raw text + visual element descriptions from VisionAgent and
+extracts typed, validated identity fields.  All interpretation happens here —
+VisionAgent deliberately does none.
 
 Output schema mirrors NestJS TextExtractionOutputSchema (extraction.dto.ts).
 """
@@ -64,10 +65,18 @@ You are a document understanding engine.
 Your task is to analyze OCR output and extract structured identity information.
 You MUST use only the provided OCR data.
 You MUST NOT infer or guess missing values.
-You MUST NOT use world knowledge beyond what is in the text.
+You MUST NOT use world knowledge beyond what is in the text and visual elements.
 
 Input OCR data:
 <<<{vision_json}>>>
+
+The input contains, per page:
+  - "text"          : verbatim transcription of all visible text
+  - "visualElements": plain-English descriptions of non-text visual elements
+                      (flags, photographs, fingerprints, signatures, stamps, etc.)
+  - "confidence"    : overall OCR quality for that page (0–1)
+  - "fullText"      : all page texts concatenated (convenience field)
+  - "averageConfidence": mean confidence across pages
 
 ---
 
@@ -76,9 +85,9 @@ Allowed document type codes:
 {doc_type_list}
 
 Classification rules:
-- Match on keywords in fullText or blocks (e.g. "REPUBLIC OF KENYA", "NATIONAL IDENTITY CARD")
+- Match on keywords in fullText (e.g. "REPUBLIC OF KENYA", "NATIONAL IDENTITY CARD")
 - Match on field patterns (ID number format, MRZ lines, header text)
-- Match on layout hints (block order, block types)
+- Match on visual element descriptions (e.g. a Kenyan flag strongly suggests a Kenyan document)
 - If uncertain → UNKNOWN, never guess
 
 ---
@@ -93,15 +102,16 @@ EXTRACTION RULES
 - Document numbers → extract exactly as written, no formatting changes
 - Do NOT correct spelling
 - Do NOT assume context
-- Track EVERY block id you used in raw.blocksUsed
+- Record which page numbers you drew from in raw.pagesReferenced
 
 ---
 
 BIOMETRICS RULES
-- photoPresent → true if a photo block exists in vision output
-- fingerprintPresent → true if a fingerprint block exists in vision output
-- signaturePresent → true if a signature block exists in vision output
-- Default all to false if block type not found
+Determine presence from the visualElements descriptions across all pages:
+- photoPresent        → true if any visualElement describes a photograph or portrait of a person
+- fingerprintPresent  → true if any visualElement describes a fingerprint or thumbprint
+- signaturePresent    → true if any visualElement describes a handwritten signature
+- Default all to false if not found in visualElements
 
 ---
 
@@ -156,7 +166,9 @@ Return ONLY valid JSON matching this exact schema. No markdown. No explanation.
     "signaturePresent": boolean
   }},
   "additionalFields": [{{"fieldName": string, "fieldValue": string}}],
-  "raw": {{"blocksUsed": string[]}},
+  "raw": {{
+    "pagesReferenced": [number]
+  }},
   "quality": {{
     "ocrConfidence": number,
     "extractionConfidence": number,
@@ -212,26 +224,33 @@ def _validate_structure_output(data: dict) -> list[str]:
     if not isinstance(address, dict):
         errors.append("address must be an object")
     else:
-        components = address.get("components", [])
-        if not isinstance(components, list):
+        if not isinstance(address.get("components", []), list):
             errors.append("address.components must be an array")
 
     # biometrics
-    biometrics = data.get("biometrics")
-    if not isinstance(biometrics, dict):
+    if not isinstance(data.get("biometrics"), dict):
         errors.append("biometrics must be an object")
+
+    # raw
+    raw = data.get("raw")
+    if not isinstance(raw, dict):
+        errors.append("raw must be an object")
+    else:
+        pages_ref = raw.get("pagesReferenced")
+        if not isinstance(pages_ref, list):
+            errors.append("raw.pagesReferenced must be an array")
+        elif not all(isinstance(p, (int, float)) for p in pages_ref):
+            errors.append("raw.pagesReferenced must contain only numbers")
 
     # quality
     quality = data.get("quality")
     if not isinstance(quality, dict):
         errors.append("quality must be an object")
     else:
-        ocr_conf = quality.get("ocrConfidence")
-        if not isinstance(ocr_conf, (int, float)) or not (0 <= ocr_conf <= 1):
-            errors.append("quality.ocrConfidence must be a decimal in [0, 1]")
-        ext_conf = quality.get("extractionConfidence")
-        if not isinstance(ext_conf, (int, float)) or not (0 <= ext_conf <= 1):
-            errors.append("quality.extractionConfidence must be a decimal in [0, 1]")
+        for field in ("ocrConfidence", "extractionConfidence"):
+            v = quality.get(field)
+            if not isinstance(v, (int, float)) or not (0 <= v <= 1):
+                errors.append(f"quality.{field} must be a decimal in [0, 1]")
         warnings = quality.get("warnings", [])
         if not isinstance(warnings, list):
             errors.append("quality.warnings must be an array")
@@ -249,6 +268,7 @@ def _sanitize_output(data: dict) -> dict:
     - Ensure documentType.code is a valid enum (fallback to UNKNOWN)
     - Round confidence values to 4 decimal places
     - Filter warnings to only valid codes
+    - Ensure pagesReferenced contains integers
     """
     doc_type = data.get("documentType", {})
     if doc_type.get("code") not in DOCUMENT_TYPE_CODES:
@@ -262,6 +282,12 @@ def _sanitize_output(data: dict) -> dict:
 
     quality["warnings"] = [
         w for w in quality.get("warnings", []) if w in VALID_WARNINGS
+    ]
+
+    raw = data.get("raw", {})
+    raw["pagesReferenced"] = [
+        int(p) for p in raw.get("pagesReferenced", [])
+        if isinstance(p, (int, float))
     ]
 
     return data
@@ -282,8 +308,10 @@ class StructureAgent:
 
     async def _call_llm(self, messages: list[dict]) -> tuple[str, dict]:
         """
-        Send the current conversation to the structure LLM and return (raw_text, usage).
-        `messages` grows across rounds: system → user → assistant → user → ...
+        Send the current conversation to the structure LLM.
+
+        messages grows across correction rounds:
+          system → user(vision output) → assistant(bad output) → user(correction) → …
         """
         start = time.perf_counter()
         response = await self._client.chat.completions.create(
@@ -312,14 +340,11 @@ class StructureAgent:
 
         Args:
             vision_output: validated output from VisionAgent
-            document_types: list of {code, name} dicts for type classification
+            document_types: list of {code} dicts for type classification
                            (defaults to all known codes if not provided)
 
         Returns:
-            (result, usage_logs, conversation) where:
-              result       — validated structure output dict
-              usage_logs   — list of per-call usage dicts (aggregated by tasks into processing_stages.usage)
-              conversation — list of correction-round records for audit/debugging
+            (result, usage_logs, conversation)
         """
         if document_types is None:
             document_types = [{"code": c} for c in DOCUMENT_TYPE_CODES]
@@ -331,21 +356,18 @@ class StructureAgent:
         )
         prompt = _build_user_prompt(vision_output, document_types)
 
-        # Build the conversation history for this extraction.
-        # Each failed round appends: assistant (bad output) → user (correction).
-        # The LLM therefore sees its own prior attempts in the assistant role.
         messages: list[dict] = [
             {"role": "system", "content": STRUCTURE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        correction_text: Optional[str] = None  # recorded for the conversation trail
+        correction_text: Optional[str] = None
         usage_logs: list[dict] = []
         conversation: list[dict] = []
 
         for attempt in range(1, self._max_iterations + 1):
             log.info("structure_agent_calling_llm", attempt=attempt, model=self._model)
             raw_text, usage = await self._call_llm(messages)
-            usage_logs.append({"stage": "TEXT", "model": self._model, "provider": provider, **usage})
+            usage_logs.append({"stage": "STRUCTURE", "model": self._model, "provider": provider, **usage})
 
             errors: list[str] = []
             try:
@@ -372,8 +394,6 @@ class StructureAgent:
                     + "\n".join(f"  - {e}" for e in errors)
                     + "\n\nPlease correct the JSON and return the full valid response."
                 )
-                # Extend the conversation: LLM sees its own bad output as assistant,
-                # then receives the correction as a new user turn.
                 messages.append({"role": "assistant", "content": raw_text})
                 messages.append({"role": "user", "content": correction_text})
                 log.warning("structure_agent_correction", attempt=attempt, errors=errors)

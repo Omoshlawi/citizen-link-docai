@@ -1,10 +1,18 @@
 """
-VisionAgent — image → structured OCR output.
+VisionAgent — image → raw text + visual element descriptions.
 
-Calls the vision LLM, validates the response against the expected schema,
-and auto-corrects up to MAX_AGENT_ITERATIONS rounds if validation fails.
+Two focused jobs per page:
+  1. Transcribe ALL text exactly as it appears (verbatim, no interpretation)
+  2. Describe meaningful non-text visual elements in plain prose
+     (flags, photographs, fingerprints, signatures, stamps, emblems, etc.)
 
-Output schema mirrors NestJS VisionExtractionOutputSchema (vision.dto.ts).
+This deliberately unstructured output is designed to feed StructureAgent,
+which handles all interpretation and field extraction.  Keeping vision
+purely observational — no block IDs, no bboxes, no type enums — removes
+the main sources of LLM hallucination and schema correction loops.
+
+Output shape per page:
+  { pageNumber, confidence, text, visualElements: [str, ...] }
 """
 
 import asyncio
@@ -23,44 +31,64 @@ from app.config import Settings
 
 log = structlog.get_logger(__name__)
 
-# ── Vision output schema (mirrors NestJS VisionExtractionOutputSchema) ─────────
+
+# ── Prompts ────────────────────────────────────────────────────────────────────
 
 VISION_SYSTEM_PROMPT = (
-    "You are a pure OCR engine. You only read. You never interpret. "
+    "You are a document reader. You observe and transcribe. You never interpret or infer. "
     "Output ONLY valid JSON — no markdown, no code fences, no text outside the JSON."
 )
 
 VISION_USER_PROMPT = """\
-You are a document OCR engine. Extract all text and identify visual regions from the provided image.
+Read this document image and produce two things:
 
-RULES:
-- Extract ALL visible text exactly as it appears (preserve casing, spacing, line breaks)
-- Never correct spelling, infer missing text, or add explanation
-- Output ONLY valid JSON, no markdown, no text outside the JSON
+1. TEXT — transcribe every visible character exactly as it appears.
+   - Preserve original casing, punctuation, spacing, and line breaks
+   - Never correct spelling, expand abbreviations, or fill in obscured text
+   - If text is partially illegible, transcribe what is visible and use [...] for the unreadable portion
 
-BLOCK TYPES:
-"text" — readable text region
-  text: exact content as seen | tags: []
+2. VISUAL ELEMENTS — describe each meaningful non-text element you can see, in plain English.
+   Focus only on elements that carry identity or document significance:
+   - National symbols: flags, coats of arms, emblems (note what they suggest about the issuing country)
+   - Biometric elements: photographs, fingerprints, signatures
+   - Security features: stamps, seals, watermarks, holograms, embossed marks
+   - Machine-readable features: barcodes, QR codes, MRZ strips (describe as visual, do not decode)
+   Ignore purely decorative borders, background patterns, and print artifacts.
 
-"photo" — image, logo, stamp, seal, signature, flag, illustration
-  text: "photo of [3-10 words describing what you see]" | tags: ["keyword1", "keyword2"]
-  Examples:
-    text: "photo of a Kenyan national flag"  tags: ["flag","kenyan"]
-    text: "photo of a blue government stamp"  tags: ["stamp","government","blue"]
-    text: "photo of a handwritten signature"  tags: ["signature","handwritten"]
+CONFIDENCE — your overall reading quality for this page:
+  0.90–1.00  clear, fully legible
+  0.70–0.89  minor blur, wear, or folds — most text readable
+  0.50–0.69  partially obscured or degraded — some text may be missing
+  below 0.50 heavily degraded — significant text loss likely
 
-CONFIDENCE: 0.9000–1.0000 clear | 0.7000–0.8999 minor blur | 0.5000–0.6999 partially obscured | <0.5000 heavily degraded
-- confidence MUST be a decimal number in [0.0000, 1.0000] rounded to 4 decimal places (e.g. 0.9234, never 92)
+confidence MUST be a decimal in [0.0000, 1.0000] rounded to 4 decimal places.
 
-OUTPUT SCHEMA:
-{"meta":{"pageCount":number,"languageHints":["string"],"engine":"vision-llm"},"pages":[{"pageNumber":number,"width":number,"height":number,"blocks":[{"id":"b1","type":"text|photo","text":"string","tags":["string"],"confidence":number,"bbox":[x_min,y_min,x_max,y_max]}]}]}
+OUTPUT SCHEMA (return exactly this, one object for the whole image):
+{
+  "meta": {
+    "pageCount": 1,
+    "engine": "vision-llm"
+  },
+  "pages": [
+    {
+      "pageNumber": 1,
+      "confidence": <number>,
+      "text": "<all visible text, line breaks as \\n>",
+      "visualElements": [
+        "<plain English description of element>",
+        "<plain English description of element>"
+      ]
+    }
+  ]
+}
 """
 
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _clean_json(text: str) -> str:
     """Strip markdown code fences if the model wraps output in them."""
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
@@ -68,33 +96,39 @@ def _clean_json(text: str) -> str:
 
 def _validate_vision_output(data: dict) -> list[str]:
     """
-    Validate the parsed vision output and return a list of missing/invalid fields.
-    Empty list means the output is valid.
+    Validate the parsed vision output. Returns a list of errors.
+    Empty list means valid.
+
+    Deliberately minimal — the model's only real jobs are transcribing text
+    and listing visual elements, so the schema has very few moving parts.
     """
     errors = []
 
-    if not isinstance(data.get("meta"), dict):
-        errors.append("meta object is missing or invalid")
-    else:
-        meta = data["meta"]
-        if not isinstance(meta.get("pageCount"), (int, float)):
-            errors.append("meta.pageCount must be a number")
-        if meta.get("engine") != "vision-llm":
-            errors.append('meta.engine must be "vision-llm"')
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        errors.append("meta must be an object")
+    elif meta.get("engine") != "vision-llm":
+        errors.append('meta.engine must be "vision-llm"')
 
     pages = data.get("pages")
     if not isinstance(pages, list) or len(pages) == 0:
         errors.append("pages must be a non-empty array")
     else:
         for i, page in enumerate(pages):
-            if not isinstance(page.get("blocks"), list):
-                errors.append(f"pages[{i}].blocks must be an array")
+            if not isinstance(page.get("text"), str):
+                errors.append(f"pages[{i}].text must be a string")
+
+            conf = page.get("confidence")
+            if not isinstance(conf, (int, float)) or not (0 <= conf <= 1):
+                errors.append(f"pages[{i}].confidence must be a decimal in [0, 1]")
+
+            if not isinstance(page.get("visualElements"), list):
+                errors.append(f"pages[{i}].visualElements must be an array")
             else:
-                for j, block in enumerate(page["blocks"]):
-                    conf = block.get("confidence")
-                    if not isinstance(conf, (int, float)) or not (0 <= conf <= 1):
+                for j, el in enumerate(page["visualElements"]):
+                    if not isinstance(el, str) or not el.strip():
                         errors.append(
-                            f"pages[{i}].blocks[{j}].confidence must be a decimal in [0, 1]"
+                            f"pages[{i}].visualElements[{j}] must be a non-empty string"
                         )
 
     return errors
@@ -102,34 +136,29 @@ def _validate_vision_output(data: dict) -> list[str]:
 
 def _compute_derived_fields(data: dict) -> dict:
     """
-    Compute fullText and averageConfidence deterministically from block content.
-    More reliable than asking the model to compute these.
+    Compute fullText and averageConfidence deterministically from page content.
+
+    fullText       — all page texts joined with a newline, trimmed per page.
+    averageConfidence — mean of per-page confidence scores, rounded to 4dp.
+
+    Both are computed here rather than asked from the model — removes a source
+    of inconsistency and keeps the prompt simpler.
     """
     pages = data.get("pages", [])
 
-    all_blocks = [b for p in pages for b in p.get("blocks", [])]
-    text_blocks = [
-        b for b in all_blocks if b.get("type") == "text" and b.get("text", "").strip()
+    # Trim page text in-place
+    for page in pages:
+        if isinstance(page.get("text"), str):
+            page["text"] = page["text"].strip()
+
+    full_text = "\n".join(page.get("text", "") for page in pages)
+
+    confidences = [
+        page["confidence"]
+        for page in pages
+        if isinstance(page.get("confidence"), (int, float))
     ]
-
-    avg_conf = (
-        round(sum(b["confidence"] for b in text_blocks) / len(text_blocks), 4)
-        if text_blocks
-        else 0.0
-    )
-
-    full_text = "\n".join(
-        b["text"].strip()
-        for p in pages
-        for b in p.get("blocks", [])
-        if b.get("type") == "text"
-    )
-
-    # Trim block text in-place
-    for p in pages:
-        for b in p.get("blocks", []):
-            if isinstance(b.get("text"), str):
-                b["text"] = b["text"].strip()
+    avg_conf = round(sum(confidences) / len(confidences), 4) if confidences else 0.0
 
     return {
         **data,
@@ -139,14 +168,16 @@ def _compute_derived_fields(data: dict) -> dict:
     }
 
 
+# ── Agent ──────────────────────────────────────────────────────────────────────
+
 class VisionAgent:
     """
     Agentic vision extraction — call → validate → auto-correct, max N rounds.
 
-    The LLM receives a proper multi-turn conversation that grows with each
-    failed round: its own bad output appears as an assistant message, and the
-    validation errors arrive as the next user message. This mirrors how the
-    model was trained for self-correction tasks.
+    Pages are processed in parallel (asyncio.gather) so total latency is
+    bounded by the slowest page, not the sum of all pages.  Each page has its
+    own isolated multi-turn conversation, so a correction on page 2 does not
+    affect page 1's context.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -171,7 +202,7 @@ class VisionAgent:
         return response.content, content_type
 
     def _build_initial_messages(self, image_bytes: bytes, mime_type: str) -> list[dict]:
-        """Build the opening system + user messages for a page."""
+        """Build the opening system + user messages for one page."""
         b64 = base64.b64encode(image_bytes).decode()
         return [
             {"role": "system", "content": VISION_SYSTEM_PROMPT},
@@ -186,8 +217,10 @@ class VisionAgent:
 
     async def _call_llm(self, messages: list[dict]) -> tuple[str, dict]:
         """
-        Send the current conversation to the vision LLM and return (raw_text, usage).
-        `messages` grows across rounds: system → user → assistant → user → ...
+        Send the current conversation to the vision LLM.
+
+        messages grows across correction rounds:
+          system → user(image) → assistant(bad output) → user(correction) → …
         """
         start = time.perf_counter()
         response = await self._client.chat.completions.create(
@@ -215,10 +248,9 @@ class VisionAgent:
         """
         Run vision extraction for a single page.
 
-        Returns (page_result, usage_logs, conversation_entries) for that page.
-        Raises AgentExhaustedError (carrying the page's conversation) if all
-        correction attempts fail — the caller merges conversations across pages
-        before re-raising so the full trail is always persisted.
+        Returns (page_result, usage_logs, conversation_entries).
+        Raises AgentExhaustedError — carrying this page's conversation trail —
+        if all correction attempts are exhausted.
         """
         log.info("vision_agent_downloading_image", page=page_num, url=url[:80])
         image_bytes, mime_type = await self._download_image(url)
@@ -270,7 +302,6 @@ class VisionAgent:
                     conversation,
                 )
 
-        # Unreachable — loop always returns or raises — but satisfies the type checker
         raise AgentExhaustedError(  # pragma: no cover
             f"Vision agent loop exited without result on page {page_num}", conversation
         )
@@ -282,17 +313,14 @@ class VisionAgent:
         """
         Run vision extraction on all provided images in parallel.
 
-        Each page is processed concurrently — total latency is bounded by the
-        slowest page rather than the sum of all pages.  Per-page isolation is
-        preserved: a failure on one page does not invalidate results already
-        obtained for other pages, and each page's correction loop operates on
-        its own focused conversation history.
+        Total latency = slowest page (not sum of pages).
+        Per-page isolation is preserved: each page has its own conversation
+        history and correction loop.
 
         Returns:
-            (result, usage_logs, conversation) where:
-              result       — validated vision output dict (with fullText + averageConfidence)
-              usage_logs   — list of per-call usage dicts, ordered by page
-              conversation — list of correction-round records for all pages, ordered by page
+            result       — merged vision output with fullText + averageConfidence
+            usage_logs   — per-call usage dicts, ordered by page then round
+            conversation — correction-round records for all pages, ordered by page
         """
         provider = (
             "ollama"
@@ -300,9 +328,6 @@ class VisionAgent:
             else "openai"
         )
 
-        # Kick off all pages concurrently.  asyncio.gather preserves order and
-        # propagates the first exception (AgentExhaustedError) after all tasks
-        # have either completed or cancelled.
         tasks = [
             self._extract_page(page_num, url, provider)
             for page_num, url in enumerate(image_urls, start=1)
@@ -311,14 +336,8 @@ class VisionAgent:
         try:
             page_outputs: list[tuple[dict, list[dict], list[dict]]] = await asyncio.gather(*tasks)
         except AgentExhaustedError:
-            # Re-collect any conversations from completed pages so the pipeline
-            # can persist the full trail even when one page fails.
-            # asyncio.gather cancels remaining tasks on the first exception —
-            # completed results are not accessible here, so we fall through and
-            # let the caller store whatever conversation was attached to the error.
-            raise
+            raise  # pipeline catches this and persists the conversation from exc.conversation
 
-        # Unzip per-page tuples into the three flat lists the caller expects
         page_results, all_usage, all_conversations = zip(*page_outputs)
 
         merged_usage = [entry for page_usage in all_usage for entry in page_usage]
@@ -327,6 +346,30 @@ class VisionAgent:
         merged = self._merge_pages(list(page_results))
         final = _compute_derived_fields(merged)
         return final, merged_usage, merged_conversations
+
+    def _merge_pages(self, page_results: list[dict]) -> dict:
+        """
+        Merge single-page vision outputs into one multi-page dict.
+        Each call to _extract_page returns a full {meta, pages:[...]} object
+        for that image — this stitches them together and re-numbers pages.
+        """
+        if len(page_results) == 1:
+            return page_results[0]
+
+        all_pages = []
+        for result in page_results:
+            all_pages.extend(result.get("pages", []))
+
+        for i, page in enumerate(all_pages, start=1):
+            page["pageNumber"] = i
+
+        return {
+            "meta": {
+                "pageCount": len(all_pages),
+                "engine": "vision-llm",
+            },
+            "pages": all_pages,
+        }
 
     async def run(
         self,
@@ -337,7 +380,7 @@ class VisionAgent:
         Unified agent interface called by the generic run_stage task.
 
         Extracts image_urls from job_input and delegates to extract().
-        previous_results is unused by the vision stage (it is always first).
+        previous_results is unused — VISION is always the first stage.
         """
         image_urls: list[str] = job_input.get("image_urls", [])
         if not image_urls:
@@ -345,33 +388,3 @@ class VisionAgent:
                 "job_input must contain a non-empty 'image_urls' list for VISION stage"
             )
         return await self.extract(image_urls)
-
-    def _merge_pages(self, page_results: list[dict]) -> dict:
-        """
-        Merge vision output from multiple images (pages) into a single output dict.
-        Page numbers are re-assigned sequentially.
-        """
-        if len(page_results) == 1:
-            return page_results[0]
-
-        all_pages = []
-        language_hints: set[str] = set()
-
-        for result in page_results:
-            language_hints.update(result.get("meta", {}).get("languageHints", []))
-            for page in result.get("pages", []):
-                all_pages.append(page)
-
-        # Re-number pages sequentially
-        for i, page in enumerate(all_pages, start=1):
-            page["pageNumber"] = i
-
-        return {
-            "meta": {
-                "sourceType": "image",
-                "pageCount": len(all_pages),
-                "languageHints": list(language_hints),
-                "engine": "vision-llm",
-            },
-            "pages": all_pages,
-        }
