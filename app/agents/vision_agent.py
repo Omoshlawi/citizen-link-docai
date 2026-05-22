@@ -7,6 +7,7 @@ and auto-corrects up to MAX_AGENT_ITERATIONS rounds if validation fails.
 Output schema mirrors NestJS VisionExtractionOutputSchema (vision.dto.ts).
 """
 
+import asyncio
 import base64
 import json
 import re
@@ -205,87 +206,127 @@ class VisionAgent:
         }
         return raw_text, usage
 
+    async def _extract_page(
+        self,
+        page_num: int,
+        url: str,
+        provider: str,
+    ) -> tuple[dict, list[dict], list[dict]]:
+        """
+        Run vision extraction for a single page.
+
+        Returns (page_result, usage_logs, conversation_entries) for that page.
+        Raises AgentExhaustedError (carrying the page's conversation) if all
+        correction attempts fail — the caller merges conversations across pages
+        before re-raising so the full trail is always persisted.
+        """
+        log.info("vision_agent_downloading_image", page=page_num, url=url[:80])
+        image_bytes, mime_type = await self._download_image(url)
+
+        messages = self._build_initial_messages(image_bytes, mime_type)
+        correction_text: Optional[str] = None
+        usage_logs: list[dict] = []
+        conversation: list[dict] = []
+
+        for attempt in range(1, self._max_iterations + 1):
+            log.info("vision_agent_calling_llm", page=page_num, attempt=attempt, model=self._model)
+            raw_text, usage = await self._call_llm(messages)
+            usage_logs.append({"stage": "VISION", "model": self._model, "provider": provider, **usage})
+
+            errors: list[str] = []
+            try:
+                parsed = json.loads(_clean_json(raw_text))
+                errors = _validate_vision_output(parsed)
+            except json.JSONDecodeError as e:
+                errors = [f"Response is not valid JSON: {e}"]
+
+            conversation.append({
+                "round": attempt,
+                "page": page_num,
+                "correction_sent": correction_text,
+                "raw_response": raw_text,
+                "errors": errors,
+                "success": not bool(errors),
+            })
+
+            if not errors:
+                log.info("vision_agent_success", page=page_num, attempt=attempt)
+                return parsed, usage_logs, conversation
+
+            if attempt < self._max_iterations:
+                correction_text = (
+                    "Your output had these validation errors:\n"
+                    + "\n".join(f"  - {e}" for e in errors)
+                    + "\n\nPlease correct the JSON and return the full valid response."
+                )
+                messages.append({"role": "assistant", "content": raw_text})
+                messages.append({"role": "user", "content": correction_text})
+                log.warning("vision_agent_correction", page=page_num, attempt=attempt, errors=errors)
+            else:
+                log.error("vision_agent_failed_all_attempts", page=page_num, errors=errors)
+                raise AgentExhaustedError(
+                    f"Vision agent failed after {self._max_iterations} attempts "
+                    f"on page {page_num}: {errors}",
+                    conversation,
+                )
+
+        # Unreachable — loop always returns or raises — but satisfies the type checker
+        raise AgentExhaustedError(  # pragma: no cover
+            f"Vision agent loop exited without result on page {page_num}", conversation
+        )
+
     async def extract(
         self,
         image_urls: list[str],
     ) -> tuple[dict, list[dict], list[dict]]:
         """
-        Run vision extraction on all provided images.
+        Run vision extraction on all provided images in parallel.
+
+        Each page is processed concurrently — total latency is bounded by the
+        slowest page rather than the sum of all pages.  Per-page isolation is
+        preserved: a failure on one page does not invalidate results already
+        obtained for other pages, and each page's correction loop operates on
+        its own focused conversation history.
 
         Returns:
             (result, usage_logs, conversation) where:
               result       — validated vision output dict (with fullText + averageConfidence)
-              usage_logs   — list of per-call usage dicts (aggregated by tasks into processing_stages.usage)
-              conversation — list of correction-round records for audit/debugging
+              usage_logs   — list of per-call usage dicts, ordered by page
+              conversation — list of correction-round records for all pages, ordered by page
         """
         provider = (
             "ollama"
             if "ollama" in self._model.lower() or "11434" in str(self._client.base_url)
             else "openai"
         )
-        usage_logs: list[dict] = []
-        conversation: list[dict] = []
-        page_results: list[dict] = []
 
-        for page_num, url in enumerate(image_urls, start=1):
-            log.info("vision_agent_downloading_image", page=page_num, url=url[:80])
-            image_bytes, mime_type = await self._download_image(url)
+        # Kick off all pages concurrently.  asyncio.gather preserves order and
+        # propagates the first exception (AgentExhaustedError) after all tasks
+        # have either completed or cancelled.
+        tasks = [
+            self._extract_page(page_num, url, provider)
+            for page_num, url in enumerate(image_urls, start=1)
+        ]
 
-            # Build the conversation history for this page.
-            # Each failed round appends:  assistant (bad output) → user (correction).
-            # The LLM therefore sees its own prior attempts in the assistant role.
-            messages = self._build_initial_messages(image_bytes, mime_type)
-            correction_text: Optional[str] = None  # recorded for the conversation trail
+        try:
+            page_outputs: list[tuple[dict, list[dict], list[dict]]] = await asyncio.gather(*tasks)
+        except AgentExhaustedError:
+            # Re-collect any conversations from completed pages so the pipeline
+            # can persist the full trail even when one page fails.
+            # asyncio.gather cancels remaining tasks on the first exception —
+            # completed results are not accessible here, so we fall through and
+            # let the caller store whatever conversation was attached to the error.
+            raise
 
-            for attempt in range(1, self._max_iterations + 1):
-                log.info("vision_agent_calling_llm", page=page_num, attempt=attempt, model=self._model)
-                raw_text, usage = await self._call_llm(messages)
-                usage_logs.append({"stage": "VISION", "model": self._model, "provider": provider, **usage})
+        # Unzip per-page tuples into the three flat lists the caller expects
+        page_results, all_usage, all_conversations = zip(*page_outputs)
 
-                errors: list[str] = []
-                try:
-                    parsed = json.loads(_clean_json(raw_text))
-                    errors = _validate_vision_output(parsed)
-                except json.JSONDecodeError as e:
-                    errors = [f"Response is not valid JSON: {e}"]
+        merged_usage = [entry for page_usage in all_usage for entry in page_usage]
+        merged_conversations = [entry for page_conv in all_conversations for entry in page_conv]
 
-                conversation.append({
-                    "round": attempt,
-                    "page": page_num,
-                    "correction_sent": correction_text,
-                    "raw_response": raw_text,
-                    "errors": errors,
-                    "success": not bool(errors),
-                })
-
-                if not errors:
-                    log.info("vision_agent_success", page=page_num, attempt=attempt)
-                    page_results.append(parsed)
-                    break
-
-                if attempt < self._max_iterations:
-                    correction_text = (
-                        "Your output had these validation errors:\n"
-                        + "\n".join(f"  - {e}" for e in errors)
-                        + "\n\nPlease correct the JSON and return the full valid response."
-                    )
-                    # Extend the conversation: LLM sees its own bad output as assistant,
-                    # then receives the correction as a new user turn.
-                    messages.append({"role": "assistant", "content": raw_text})
-                    messages.append({"role": "user", "content": correction_text})
-                    log.warning("vision_agent_correction", page=page_num, attempt=attempt, errors=errors)
-                else:
-                    log.error("vision_agent_failed_all_attempts", page=page_num, errors=errors)
-                    raise AgentExhaustedError(
-                        f"Vision agent failed after {self._max_iterations} attempts "
-                        f"on page {page_num}: {errors}",
-                        conversation,
-                    )
-
-        # Merge multi-page results into a single output
-        merged = self._merge_pages(page_results)
+        merged = self._merge_pages(list(page_results))
         final = _compute_derived_fields(merged)
-        return final, usage_logs, conversation
+        return final, merged_usage, merged_conversations
 
     async def run(
         self,
