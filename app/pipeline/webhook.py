@@ -100,7 +100,7 @@ async def deliver_webhook(
         log.info(
             "webhook_delivered",
             job_id=job_id,
-            event=event.value,
+            webhook_event=event.value,
             status_code=response_status,
         )
 
@@ -108,7 +108,7 @@ async def deliver_webhook(
         log.error(
             "webhook_http_error",
             job_id=job_id,
-            event=event.value,
+            webhook_event=event.value,
             status_code=exc.response.status_code,
             attempt=attempt_count,
         )
@@ -118,7 +118,7 @@ async def deliver_webhook(
         log.error(
             "webhook_delivery_failed",
             job_id=job_id,
-            event=event.value,
+            webhook_event=event.value,
             error=str(exc),
             attempt=attempt_count,
         )

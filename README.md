@@ -54,7 +54,7 @@ Embedding is intentionally not part of the extraction pipeline. AI-extracted fie
 - Prompt changes → edit one file in docai, zero NestJS changes
 - New pipelines → add a `PipelineConfig` entry and a typed endpoint, zero infrastructure changes
 - Scale AI processing independently from the NestJS API server
-- Full audit trail — cost, latency, token counts, and every correction round per model call
+- Full audit trail — cost, latency, token counts, and every message turn per model call
 - Agent correction loops with proper multi-turn conversation — bad LLM output is auto-corrected before the caller ever sees it
 - Rule-based quality gates fail fast before spending tokens on downstream stages
 
@@ -102,7 +102,8 @@ NestJS (business logic)
 | **Webhook delivery via ARQ** | `task_deliver_webhook` is itself an ARQ task — ARQ retries it automatically on failure. Every attempt logged to `webhook_deliveries`. |
 | **Own PostgreSQL** | Fully autonomous — no shared schema with NestJS. No caller IDs stored here at all. |
 | **Pre-signed S3 URLs** | Caller generates URLs before calling docai. docai downloads via plain httpx — no S3 SDK needed here. |
-| **Multi-turn agent correction** | Each failed round appends the LLM's bad output as `assistant` and the validation errors as `user`. The model sees its own failure history and corrects itself. |
+| **Per-turn conversation storage** | Each LLM message turn (system/user/assistant) gets its own `stage_conversations` row. Concatenating all turns in order reconstructs the full conversation thread. System prompts are stored per-job — a snapshot of the exact prompt at processing time. |
+| **No base64 in DB** | Vision user rows store the signed download URL in `metadata`, not the base64 bytes. The image lives in MinIO; the URL is the audit reference. |
 | **Per-job webhook URL** | `webhook_url` is part of the job request body — one docai instance can serve multiple independent callers. |
 | **JSONB for variable fields** | Result data, usage metrics, and conversation metadata live in JSONB columns. New fields never require a migration. |
 
@@ -132,7 +133,7 @@ PIPELINES: dict[str, PipelineConfig] = {
 |---|---|---|
 | `namespace` | `str` | Dot-notation event prefix (e.g. `"extraction"`). All webhook event names are derived from this automatically — `{namespace}.{stage.lower()}.success`, `{namespace}.success`, `{namespace}.{stage.lower()}.failed`, `{namespace}.failed`. |
 | `stages` | `list[str]` | Ordered stage names — `run_stage` dispatches left-to-right |
-| `build_result` | `callable` | Assembles the `{namespace}.success` terminal payload from all stage results. Should return a dict nested by stage name. |
+| `build_result` | `callable` | Assembles the `{namespace}.success` terminal payload from all stage results. Returns a dict nested by stage name. |
 | `post_stage_gate` | `dict[stage → callable]` | Rule-based fast-fail checks run after a stage succeeds, before the success event fires or the next stage is enqueued |
 
 All event strings are constructed dynamically — adding a stage to any pipeline automatically produces the right events with zero manual wiring.
@@ -143,36 +144,47 @@ All event strings are constructed dynamically — adding a stage to any pipeline
 
 Both `VisionAgent` and `StructureAgent` maintain a proper multi-turn conversation with the LLM across correction rounds. Each failed round does **not** start fresh — the model sees its own prior attempts in the `assistant` role, which is how it was trained to self-correct.
 
+### What the LLM sees (accumulated context per call)
+
 ```
-Round 1:
+Round 1 call:
   system    → "You are a document reader. You observe and transcribe..."
   user      → [extraction instructions + image]
 
-  → LLM responds with bad output (e.g. wrong schema)
-
-Round 2:
+Round 2 call (if round 1 failed validation):
   system    → "You are a document reader..."
-  user      → [extraction instructions + image]   ← same initial ask
-  assistant → "{...bad output from round 1...}"   ← what it actually said
+  user      → [extraction instructions + image]
+  assistant → "{...bad output from round 1...}"
   user      → "Your output had these errors: [...]. Please correct."
 
-  → LLM responds (better output, or still wrong)
-
-Round 3 (if needed):
+Round 3 call (if round 2 also failed):
   system    → ...
-  user      → [initial ask]
+  user      → [initial ask + image]
   assistant → "{...round 1 output...}"
   user      → "Errors: [...]"
   assistant → "{...round 2 output...}"
   user      → "Still invalid. Errors: [...]. Please correct."
-
-After MAX_AGENT_ITERATIONS failures:
-  → AgentExhaustedError raised (carries full conversation trail)
-  → FAILED stage row stored with all rounds
-  → extraction.{stage}.failed + extraction.failed webhooks sent
 ```
 
-Every round — whether it succeeds or fails — is persisted to `stage_conversations` so you have a complete audit trail of how the model arrived at its output (or why it couldn't).
+### How it is stored (delta per round, no duplication)
+
+Each round writes only its new turns to `stage_conversations`. Concatenating all rows in order reconstructs the full thread:
+
+```
+round=1  role=system     content="You are a document reader..."
+round=1  role=user       content="Read this document image..."   metadata={"url":"...","mime_type":"image/jpeg"}
+round=1  role=assistant  content="<bad output>"                  success=false  metadata={"errors":[...]}
+
+round=2  role=user       content="Your output had these errors: ..."
+round=2  role=assistant  content="<valid output>"                success=true
+```
+
+Round 1 stores the full opening exchange (system + user + assistant). Rounds 2+ store only the correction user message and the new assistant response. The system prompt is stored once per job — a frozen snapshot of the prompt at processing time, so historical records remain accurate if the prompt later changes.
+
+After `MAX_AGENT_ITERATIONS` failures:
+- `AgentExhaustedError` raised (carries all conversation turns)
+- FAILED stage row stored with all rounds' turns
+- `extraction.{stage}.failed` + `extraction.failed` webhooks sent
 
 ### Vision Agent — what it extracts
 
@@ -205,7 +217,7 @@ POST /v1/jobs/extraction received
   → Download images via pre-signed URLs
   → VisionAgent: parallel page extraction, multi-turn correction per page
   → Store processing_stages row (VISION / SUCCESS or FAILED)
-  → Store stage_conversations rows (one per LLM call per page)
+  → Store stage_conversations rows (one row per message turn per page)
   → Post-stage gate check (OCR confidence + text length)
       → gate fails:  fire extraction.vision.failed + extraction.failed → stop (no retry)
       → gate passes: continue
@@ -217,7 +229,7 @@ POST /v1/jobs/extraction received
   → Read VISION result from processing_stages (plain dict from DB JSONB)
   → StructureAgent: multi-turn LLM conversation, max N rounds
   → Store processing_stages row (STRUCTURE / SUCCESS or FAILED)
-  → Store stage_conversations rows
+  → Store stage_conversations rows (one row per message turn)
   → Fire: extraction.structure.success { documentType, person, document, … }
   → Mark job: COMPLETED
   → Fire: extraction.success { vision: {…}, structure: {…} }   ← terminal
@@ -231,7 +243,7 @@ POST /v1/jobs/extraction received
 **On any stage failure:**
 ```
   → Store processing_stages row (status: FAILED, error: reason)
-  → Store stage_conversations rows (all rounds attempted)
+  → Store stage_conversations rows (all turns attempted)
   → Mark job: FAILED
   → Fire: extraction.{stage}.failed { reason }          ← stage-specific
   → Fire: extraction.failed { failedAt, reason }         ← flat rollup
@@ -275,6 +287,8 @@ _MIN_TEXT_LENGTH    = 25     # below this, not enough text for meaningful field 
 
 ## API Endpoints
 
+### Submission & status
+
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `GET` | `/health` | None | Liveness — always 200 if the process is alive |
@@ -284,6 +298,18 @@ _MIN_TEXT_LENGTH    = 25     # below this, not enough text for meaningful field 
 | `GET` | `/v1/jobs/{jobId}` | `X-Internal-Secret` | Poll a single job status |
 | `POST` | `/v1/embed` | `X-Internal-Secret` | Generate an embedding vector |
 | `GET` | `/docs` | None | Swagger UI (disable in production) |
+
+### Inspection (observability)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/stages` | List processing stages; filters: `job_id`, `job_type`, `stage`, `status`; opt-in `include_result` |
+| `GET` | `/v1/stages/{stage_id}` | Single stage + optional nested conversations |
+| `GET` | `/v1/jobs/{job_id}/stages` | All stages for one job; optional `include_result` + `include_conversations` |
+| `GET` | `/v1/conversations` | List message turns; filters: `job_id`, `stage_id`, `stage`, `role`, `success`, `page_num` |
+| `GET` | `/v1/stages/{stage_id}/conversations` | All turns for one stage, in conversation order |
+| `GET` | `/v1/webhooks` | List delivery attempts; filters: `job_id`, `event` (prefix match), `delivered` |
+| `GET` | `/v1/webhooks/{delivery_id}` | Single delivery with full payload |
 
 ### POST /v1/jobs/extraction
 
@@ -416,7 +442,7 @@ Every POST has this shape:
   },
   "structure": {
     "documentType": { "code": "NATIONAL_ID", "confidence": 0.97 },
-    "person": { "fullName": "JOHN KAMAU DOE", "..." : "..." },
+    "person": { "fullName": "JOHN KAMAU DOE", "...": "..." },
     "quality": { "extractionConfidence": 0.88, "warnings": [] }
   }
 }
@@ -424,9 +450,7 @@ Every POST has this shape:
 
 **`extraction.vision.failed`** / **`extraction.structure.failed`** — stage-specific failure:
 ```json
-{
-  "reason": "Document image quality is too poor to process (OCR confidence 23% — minimum 40%). Please upload a clearer, well-lit image of the document."
-}
+{ "reason": "Document image quality is too poor to process (OCR confidence 23% — minimum 40%). Please upload a clearer, well-lit image of the document." }
 ```
 
 **`extraction.failed`** — flat rollup (fires alongside the stage event):
@@ -449,12 +473,12 @@ Tracks the lifecycle of each job. The `input` JSONB column holds pipeline-specif
 ```sql
 processing_jobs (
   id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  job_type      TEXT        NOT NULL,                      -- 'EXTRACTION' | future types
-  input         JSONB       NOT NULL,                      -- pipeline-specific parameters
+  job_type      TEXT        NOT NULL DEFAULT 'EXTRACTION',  -- 'EXTRACTION' | future types
+  input         JSONB       NOT NULL DEFAULT '{}',          -- pipeline-specific parameters
   webhook_url   TEXT        NOT NULL,
-  priority      INT         NOT NULL DEFAULT 5,            -- 1 (highest) to 10 (lowest)
-  status        TEXT        NOT NULL DEFAULT 'PENDING',    -- PENDING | IN_PROGRESS | COMPLETED | FAILED
-  current_stage TEXT,                                      -- VISION | STRUCTURE | null
+  priority      INT         NOT NULL DEFAULT 5,             -- 1 (highest) to 10 (lowest)
+  status        TEXT        NOT NULL DEFAULT 'PENDING',     -- PENDING | IN_PROGRESS | COMPLETED | FAILED
+  current_stage TEXT,                                       -- VISION | STRUCTURE | null
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
@@ -480,20 +504,34 @@ processing_stages (
 ```
 
 ### `stage_conversations`
-One row per LLM call within a stage. Full audit trail of every correction round.
+One row per LLM **message turn** within a stage. Concatenating all rows for a stage in `round, created_at` order reconstructs the full conversation thread with zero duplication.
 
 ```sql
 stage_conversations (
   id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   stage_id   UUID        NOT NULL REFERENCES processing_stages(id) ON DELETE CASCADE,
-  job_id     UUID        NOT NULL REFERENCES processing_jobs(id) ON DELETE CASCADE,
-  round      INT         NOT NULL,        -- which correction attempt (1 = first call)
-  page       INT,                         -- which image page (vision only; null for structure)
-  success    BOOLEAN     NOT NULL,        -- did this round pass validation?
-  metadata   JSONB,                       -- { correction_sent, raw_response, errors }
+  job_id     UUID        NOT NULL REFERENCES processing_jobs(id)   ON DELETE CASCADE,
+  round      INT         NOT NULL,        -- correction round (1 = first call, 2+ = corrections)
+  page       INT,                         -- image page number (Vision only; null for Structure)
+  role       TEXT        NOT NULL,        -- 'system' | 'user' | 'assistant'
+  content    TEXT        NOT NULL,        -- message text — prompt or LLM response
+  success    BOOLEAN,                     -- NULL for system/user rows; TRUE/FALSE on assistant rows
+  metadata   JSONB,                       -- Vision user rows: { url, mime_type }
+                                         -- Failed assistant rows: { errors: [...] }
+                                         -- All other rows: NULL
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 ```
+
+**Row pattern for a 2-round Vision extraction (page 1):**
+
+| round | page | role | content | success | metadata |
+|---|---|---|---|---|---|
+| 1 | 1 | system | `You are a document reader…` | NULL | NULL |
+| 1 | 1 | user | `Read this document image…` | NULL | `{"url":"https://…","mime_type":"image/jpeg"}` |
+| 1 | 1 | assistant | `<bad response>` | false | `{"errors":["pages must be…"]}` |
+| 2 | 1 | user | `Your output had these errors: …` | NULL | NULL |
+| 2 | 1 | assistant | `<valid response>` | true | NULL |
 
 ### `webhook_deliveries`
 Audit trail for every callback attempt. The `stage` column stores the full event string (e.g. `extraction.vision.success`).
@@ -530,12 +568,7 @@ citizen-link-docai/
 │   ├── env.py                       # Reads DATABASE_URL from env, no ORM
 │   ├── alembic.ini
 │   └── versions/
-│       ├── 001_initial_schema.py
-│       ├── 002_slim_processing_jobs.py
-│       ├── 003_extraction_conversation_trail.py
-│       ├── 004_processing_stages.py
-│       ├── 005_stage_conversations_table.py
-│       └── 006_generic_job_input.py
+│       └── 001_initial_schema.py    # Single migration — complete current schema
 │
 └── app/
     ├── config.py                    # pydantic-settings — all env vars, one source of truth
@@ -561,8 +594,13 @@ citizen-link-docai/
     │   ├── service.py               # EmbeddingService — wraps AsyncOpenAI (Ollama + OpenAI)
     │   └── router.py                # POST /v1/embed
     │
+    ├── inspection/                  # Read-only observability endpoints
+    │   ├── schemas.py               # StageResponse, ConversationResponse, WebhookDeliveryResponse
+    │   ├── repository.py            # Paginated queries with joins across all four tables
+    │   └── router.py                # GET /v1/stages, /v1/conversations, /v1/webhooks + sub-routes
+    │
     ├── agents/                      # Agentic LLM processors with multi-turn correction loop
-    │   ├── exceptions.py            # AgentExhaustedError — carries conversation trail on failure
+    │   ├── exceptions.py            # AgentExhaustedError — carries conversation turns on failure
     │   ├── vision_agent.py          # Image URLs → VisionOutput (parallel pages, max N rounds each)
     │   └── structure_agent.py       # VisionOutput → StructureOutput (max N rounds)
     │
@@ -628,7 +666,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env — set DATABASE_URL, adjust Ollama URLs
+# Edit .env — set DATABASE_URL, adjust model URLs and secrets
 ```
 
 ```bash
@@ -723,7 +761,7 @@ curl -X POST http://localhost:8002/v1/jobs/extraction \
   }'
 ```
 
-### Inspecting stage results and webhook deliveries
+### Inspecting stage results and conversation history
 
 ```bash
 # Stage results and token costs
@@ -734,18 +772,43 @@ docker compose exec db psql -U docai -d citizen-link-docai \
              completed_at - started_at AS duration
       FROM processing_stages ORDER BY created_at DESC LIMIT 10;"
 
-# Correction rounds for a specific job
+# Full conversation thread for a specific job (reads like a chat log)
 docker compose exec db psql -U docai -d citizen-link-docai \
-  -c "SELECT sc.round, sc.page, sc.success, sc.metadata->'errors' AS errors
+  -c "SELECT sc.round, sc.page, sc.role, sc.success,
+             left(sc.content, 80) AS content_preview,
+             sc.metadata
       FROM stage_conversations sc
       JOIN processing_stages ps ON ps.id = sc.stage_id
       WHERE ps.job_id = '<job_id>'
-      ORDER BY sc.page, sc.round;"
+      ORDER BY ps.created_at, sc.page NULLS LAST, sc.round, sc.created_at;"
+
+# Failed assistant turns across all jobs (validation errors visible without JSON parsing)
+docker compose exec db psql -U docai -d citizen-link-docai \
+  -c "SELECT sc.job_id, sc.round, sc.page, sc.metadata->'errors' AS errors
+      FROM stage_conversations sc
+      WHERE sc.role = 'assistant' AND sc.success = false
+      ORDER BY sc.created_at DESC LIMIT 20;"
 
 # Webhook delivery history (stage column holds the full event string)
 docker compose exec db psql -U docai -d citizen-link-docai \
   -c "SELECT stage AS event, delivered, response_status, attempt_count
       FROM webhook_deliveries ORDER BY created_at DESC;"
+```
+
+Or use the inspection REST API:
+
+```bash
+# All stages for a job with conversations nested
+curl "http://localhost:8002/v1/jobs/<job_id>/stages?include_conversations=true" \
+  -H "X-Internal-Secret: $INTERNAL_SECRET"
+
+# All failed assistant turns across all jobs
+curl "http://localhost:8002/v1/conversations?success=false" \
+  -H "X-Internal-Secret: $INTERNAL_SECRET"
+
+# Webhook delivery attempts for a job
+curl "http://localhost:8002/v1/webhooks?job_id=<job_id>" \
+  -H "X-Internal-Secret: $INTERNAL_SECRET"
 ```
 
 ---
@@ -853,7 +916,7 @@ ARQ uses Redis as coordination — multiple workers safely dequeue different job
 
 ### Logs
 
-All log lines are JSON (structlog). Every pipeline task binds `job_id` and `event` to the log context:
+All log lines are JSON (structlog). Every pipeline task binds `job_id` to the log context:
 
 ```bash
 docker compose logs worker | grep '"job_id": "your-uuid"'
@@ -901,7 +964,15 @@ JOB_ID=$(curl -sX POST http://localhost:8002/v1/jobs/extraction \
 docker compose exec db psql -U docai -d citizen-link-docai \
   -c "SELECT status, current_stage, updated_at FROM processing_jobs WHERE id = '$JOB_ID';"
 
-# Check events fired (stage column holds the full event string)
+# Check conversation turns stored (read like a chat log)
+docker compose exec db psql -U docai -d citizen-link-docai \
+  -c "SELECT round, page, role, success, left(content, 60) AS preview
+      FROM stage_conversations sc
+      JOIN processing_stages ps ON ps.id = sc.stage_id
+      WHERE ps.job_id = '$JOB_ID'
+      ORDER BY ps.created_at, sc.page NULLS LAST, sc.round, sc.created_at;"
+
+# Check events fired
 docker compose exec db psql -U docai -d citizen-link-docai \
   -c "SELECT stage AS event, delivered, response_status, attempt_count
       FROM webhook_deliveries WHERE job_id = '$JOB_ID' ORDER BY created_at;"
