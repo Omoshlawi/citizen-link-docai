@@ -226,6 +226,8 @@ class InspectionRepository:
                 sc.job_id::text,
                 sc.round,
                 sc.page,
+                sc.role,
+                sc.content,
                 sc.success,
                 sc.metadata,
                 sc.created_at,
@@ -236,7 +238,7 @@ class InspectionRepository:
             JOIN processing_stages ps ON ps.id = sc.stage_id
             JOIN processing_jobs   pj ON pj.id = sc.job_id
             {where}
-            ORDER BY sc.job_id, sc.stage_id, sc.page NULLS LAST, sc.round
+            ORDER BY sc.job_id, sc.stage_id, sc.page NULLS LAST, sc.round, sc.created_at
             LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
             """,
             *params, page_size, offset,
@@ -259,7 +261,7 @@ class InspectionRepository:
         self,
         stage_id: str,
     ) -> List[asyncpg.Record]:
-        """All conversation rounds for one stage, ordered by page then round."""
+        """All message turns for one stage, ordered by round then insertion order."""
         return await self._pool.fetch(
             """
             SELECT
@@ -268,6 +270,8 @@ class InspectionRepository:
                 sc.job_id::text,
                 sc.round,
                 sc.page,
+                sc.role,
+                sc.content,
                 sc.success,
                 sc.metadata,
                 sc.created_at,
@@ -278,7 +282,7 @@ class InspectionRepository:
             JOIN processing_stages ps ON ps.id = sc.stage_id
             JOIN processing_jobs   pj ON pj.id = sc.job_id
             WHERE sc.stage_id = $1::uuid
-            ORDER BY sc.page NULLS LAST, sc.round
+            ORDER BY sc.page NULLS LAST, sc.round, sc.created_at
             """,
             stage_id,
         )
@@ -287,7 +291,7 @@ class InspectionRepository:
         self,
         job_id: str,
     ) -> List[asyncpg.Record]:
-        """All conversations across all stages for one job."""
+        """All message turns across all stages for one job."""
         return await self._pool.fetch(
             """
             SELECT
@@ -296,6 +300,8 @@ class InspectionRepository:
                 sc.job_id::text,
                 sc.round,
                 sc.page,
+                sc.role,
+                sc.content,
                 sc.success,
                 sc.metadata,
                 sc.created_at,
@@ -306,7 +312,7 @@ class InspectionRepository:
             JOIN processing_stages ps ON ps.id = sc.stage_id
             JOIN processing_jobs   pj ON pj.id = sc.job_id
             WHERE sc.job_id = $1::uuid
-            ORDER BY ps.created_at ASC, sc.page NULLS LAST, sc.round
+            ORDER BY ps.created_at ASC, sc.page NULLS LAST, sc.round, sc.created_at
             """,
             job_id,
         )

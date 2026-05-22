@@ -338,9 +338,14 @@ class StructureAgent:
             {"role": "system", "content": STRUCTURE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        correction_text: Optional[str] = None
         usage_entries: list[UsageEntry] = []
-        conversation: list[ConversationEntry] = []
+
+        # Round 1 opening turns — system identity + user task with full vision output.
+        # Stored once; subsequent rounds only add user(correction) + assistant turns.
+        conversation: list[ConversationEntry] = [
+            ConversationEntry(round=1, role="system", content=STRUCTURE_SYSTEM_PROMPT),
+            ConversationEntry(round=1, role="user",   content=prompt),
+        ]
 
         for attempt in range(1, self._max_iterations + 1):
             log.info("structure_agent_calling_llm", attempt=attempt, model=self._model)
@@ -364,11 +369,10 @@ class StructureAgent:
                 errors = [f"Response is not valid JSON: {e}"]
 
             conversation.append(ConversationEntry(
-                round=attempt,
-                correction_sent=correction_text,
-                raw_response=raw_text,
-                errors=errors,
+                round=attempt, role="assistant",
+                content=raw_text,
                 success=not bool(errors),
+                metadata={"errors": errors} if errors else None,
             ))
 
             if not errors and parsed is not None:
@@ -384,6 +388,10 @@ class StructureAgent:
                 )
                 messages.append({"role": "assistant", "content": raw_text})
                 messages.append({"role": "user", "content": correction_text})
+                conversation.append(ConversationEntry(
+                    round=attempt + 1, role="user",
+                    content=correction_text,
+                ))
                 log.warning("structure_agent_correction", attempt=attempt, errors=errors)
             else:
                 log.error("structure_agent_failed_all_attempts", errors=errors)

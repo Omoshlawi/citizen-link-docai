@@ -56,21 +56,34 @@ class StageListResponse(Page):
 
 class ConversationResponse(BaseModel):
     """
-    One stage_conversations row, joined with its stage and job.
+    One stage_conversations row — one message turn in an LLM conversation.
 
-    Each row represents one LLM call (correction round).  round=1 is the first
-    attempt; round>1 means the model needed correction.
+    Turns are ordered by round then role (system → user → assistant).
+    Concatenating all turns for a stage in order reconstructs the full
+    conversation thread.
+
+    Round 1 contains: system + user + assistant turns.
+    Rounds 2+  contain: user(correction) + assistant turns only.
     """
 
     conversation_id: str
     stage_id: str
     job_id: str
-    round: int = Field(description="Correction round number (1 = first attempt)")
-    page: Optional[int] = Field(None, description="Image page number (vision only; null for structure)")
-    success: bool = Field(description="True if this round produced valid output")
+    round: int = Field(description="Correction round (1 = first attempt; 2+ = correction rounds)")
+    page: Optional[int] = Field(None, description="Image page number (Vision only; null for Structure)")
+    role: str = Field(description="Message role: system | user | assistant")
+    content: str = Field(description="Message text — prompt or LLM response")
+    success: Optional[bool] = Field(
+        None,
+        description="Whether the response was valid — set only on assistant rows",
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         None,
-        description="{ correction_sent, raw_response, errors } — always included",
+        description=(
+            "Extra turn context. "
+            "Vision user rows: {url, mime_type} — the signed URL downloaded for this call. "
+            "Failed assistant rows: {errors: [...]} — validation errors that triggered correction."
+        ),
     )
     created_at: datetime
     # Joined from processing_stages

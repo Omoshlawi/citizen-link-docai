@@ -66,6 +66,8 @@ def _to_conversation(row) -> ConversationResponse:
         job_id=row["job_id"],
         round=row["round"],
         page=row["page"],
+        role=row["role"],
+        content=row["content"],
         success=row["success"],
         metadata=_loads(row["metadata"]),
         created_at=row["created_at"],

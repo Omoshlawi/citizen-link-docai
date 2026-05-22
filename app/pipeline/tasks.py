@@ -80,7 +80,7 @@ async def _store_conversation(
     job_id: str,
     conversation: list[ConversationEntry],
 ) -> None:
-    """Bulk-insert one stage_conversations row per correction round."""
+    """Bulk-insert one stage_conversations row per message turn."""
     if not conversation:
         return
     rows = [
@@ -89,17 +89,19 @@ async def _store_conversation(
             job_id,
             entry.round,
             entry.page,
+            entry.role,
+            entry.content,
             entry.success,
-            json.dumps(entry.to_dict()),
+            json.dumps(entry.metadata) if entry.metadata is not None else None,
         )
         for entry in conversation
     ]
     await pool.executemany(
         """
         INSERT INTO stage_conversations
-            (stage_id, job_id, round, page, success, metadata)
+            (stage_id, job_id, round, page, role, content, success, metadata)
         VALUES
-            ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)
+            ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb)
         """,
         rows,
     )

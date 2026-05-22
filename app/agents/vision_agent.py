@@ -184,6 +184,47 @@ class VisionAgent:
         content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
         return response.content, content_type
 
+    @staticmethod
+    def _sanitize_messages(
+        messages: list[dict],
+        page_num: int,
+        source_url: str = "",
+    ) -> list[dict]:
+        """
+        Return a storage-safe copy of a messages slice.
+
+        Base64 image data URIs are replaced with a lightweight reference so
+        the JSONB payload stays compact.  The original signed URL is preserved
+        so an auditor can see exactly which image was downloaded for this call.
+
+        Example replacement:
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+          → {"type": "image_ref", "page": 1, "mime_type": "image/jpeg", "url": "<signed-url>"}
+        """
+        sanitized: list[dict] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_parts: list[dict] = []
+                for part in content:
+                    if part.get("type") == "image_url":
+                        data_uri: str = part.get("image_url", {}).get("url", "")
+                        mime_type = "image/jpeg"
+                        if data_uri.startswith("data:") and ";" in data_uri:
+                            mime_type = data_uri[5:data_uri.index(";")]
+                        new_parts.append({
+                            "type": "image_ref",
+                            "page": page_num,
+                            "mime_type": mime_type,
+                            "url": source_url,
+                        })
+                    else:
+                        new_parts.append(dict(part))
+                sanitized.append({**msg, "content": new_parts})
+            else:
+                sanitized.append(dict(msg))
+        return sanitized
+
     def _build_initial_messages(self, image_bytes: bytes, mime_type: str) -> list[dict]:
         """Build the opening system + user messages for one page."""
         b64 = base64.b64encode(image_bytes).decode()
@@ -239,9 +280,21 @@ class VisionAgent:
         image_bytes, mime_type = await self._download_image(url)
 
         messages = self._build_initial_messages(image_bytes, mime_type)
-        correction_text: Optional[str] = None
         usage_entries: list[UsageEntry] = []
-        conversation: list[ConversationEntry] = []
+
+        # Round 1 opening turns — system identity + user task with image reference.
+        # Stored once; subsequent rounds only add user(correction) + assistant turns.
+        conversation: list[ConversationEntry] = [
+            ConversationEntry(
+                round=1, page=page_num, role="system",
+                content=VISION_SYSTEM_PROMPT,
+            ),
+            ConversationEntry(
+                round=1, page=page_num, role="user",
+                content=VISION_USER_PROMPT,
+                metadata={"url": url, "mime_type": mime_type},
+            ),
+        ]
 
         for attempt in range(1, self._max_iterations + 1):
             log.info("vision_agent_calling_llm", page=page_num, attempt=attempt, model=self._model)
@@ -265,12 +318,10 @@ class VisionAgent:
                 errors = [f"Response is not valid JSON: {e}"]
 
             conversation.append(ConversationEntry(
-                round=attempt,
-                page=page_num,
-                correction_sent=correction_text,
-                raw_response=raw_text,
-                errors=errors,
+                round=attempt, page=page_num, role="assistant",
+                content=raw_text,
                 success=not bool(errors),
+                metadata={"errors": errors} if errors else None,
             ))
 
             if not errors and parsed is not None:
@@ -285,6 +336,10 @@ class VisionAgent:
                 )
                 messages.append({"role": "assistant", "content": raw_text})
                 messages.append({"role": "user", "content": correction_text})
+                conversation.append(ConversationEntry(
+                    round=attempt + 1, page=page_num, role="user",
+                    content=correction_text,
+                ))
                 log.warning("vision_agent_correction", page=page_num, attempt=attempt, errors=errors)
             else:
                 log.error("vision_agent_failed_all_attempts", page=page_num, errors=errors)

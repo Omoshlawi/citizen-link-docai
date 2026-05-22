@@ -28,25 +28,29 @@ _COST_PER_1M: dict[str, dict[str, float]] = {
 @dataclass
 class ConversationEntry:
     """
-    One correction round in an agent's multi-turn conversation.
+    One message turn in an agent's LLM conversation.
 
-    page is set only for VisionAgent (per-page processing);
-    StructureAgent leaves it None.
+    Each turn maps directly to one stage_conversations row:
+      role    — system | user | assistant
+      content — the message text (prompt text or LLM response)
+      page    — Vision only; None for Structure
+      success — set only on assistant rows (True = valid response)
+      metadata:
+        user rows (Vision)      : {"url": "<signed-url>", "mime_type": "image/jpeg"}
+        assistant rows (failed) : {"errors": ["...", ...]}
+        all other rows          : None
+
+    Round 1 always contains: system + user + assistant turns.
+    Rounds 2+ contain only:  user(correction) + assistant turns.
+    Concatenating all turns in round/created_at order reconstructs the full
+    conversation thread with zero duplication.
     """
     round: int
-    success: bool
-    raw_response: str
-    errors: list[str] = field(default_factory=list)
-    correction_sent: Optional[str] = None
-    page: Optional[int] = None
-
-    def to_dict(self) -> dict:
-        """Serialise for JSONB storage in stage_conversations.metadata."""
-        return {
-            "correction_sent": self.correction_sent,
-            "raw_response": self.raw_response,
-            "errors": self.errors,
-        }
+    role: str                           # system | user | assistant
+    content: str
+    page: Optional[int] = None          # Vision only
+    success: Optional[bool] = None      # assistant rows only
+    metadata: Optional[dict] = None     # see docstring above
 
 
 @dataclass
