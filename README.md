@@ -10,8 +10,10 @@
 
 - [Why This Service Exists](#why-this-service-exists)
 - [Architecture Overview](#architecture-overview)
+- [Pipeline Registry](#pipeline-registry)
 - [Agent Correction Loop](#agent-correction-loop)
 - [Pipeline Stages](#pipeline-stages)
+- [Post-Stage Quality Gate](#post-stage-quality-gate)
 - [API Endpoints](#api-endpoints)
 - [Webhook Payload (docai → caller)](#webhook-payload-docai--caller)
 - [Database Schema](#database-schema)
@@ -20,7 +22,7 @@
 - [Running Locally (without Docker)](#running-locally-without-docker)
 - [Running with Docker](#running-with-docker)
 - [Development Guide](#development-guide)
-- [Adding a New Pipeline Stage](#adding-a-new-pipeline-stage)
+- [Adding a New Pipeline](#adding-a-new-pipeline)
 - [Deployment Notes](#deployment-notes)
 - [Verification Checklist](#verification-checklist)
 
@@ -39,7 +41,7 @@ This created tight coupling between business logic and AI infrastructure. Every 
 
 | Call | Direction | Purpose |
 |---|---|---|
-| `POST /v1/process` | NestJS → docai | Fire an extraction job (202, async) |
+| `POST /v1/jobs/extraction` | NestJS → docai | Fire an extraction job (202, async) |
 | `POST /api/webhooks/docai/progress` | docai → NestJS | Stage callbacks with results |
 | `POST /v1/embed` | caller → docai | Synchronous embedding for RAG |
 
@@ -50,9 +52,11 @@ Embedding is intentionally not part of the extraction pipeline. AI-extracted fie
 **Benefits:**
 - AI model changes → update one env var, redeploy docai, zero NestJS changes
 - Prompt changes → edit one file in docai, zero NestJS changes
+- New pipelines → add a `PipelineConfig` entry and a typed endpoint, zero infrastructure changes
 - Scale AI processing independently from the NestJS API server
 - Full audit trail — cost, latency, token counts, and every correction round per model call
 - Agent correction loops with proper multi-turn conversation — bad LLM output is auto-corrected before the caller ever sees it
+- Rule-based quality gates fail fast before spending tokens on downstream stages
 
 ---
 
@@ -64,16 +68,17 @@ Mobile / Web
      ▼
 NestJS (business logic)
      │
-     ├── POST /v1/process ──────────────────────► citizen-link-docai
-     │   202 Accepted (fire and forget)                    │
-     │                                            ┌─────────────────┐
-     │                                            │   ARQ Worker    │
-     │                                            │                 │
-     │                                            │  1. run_vision  │
-     │                                            │  2. run_structure│
-     │                                            └────────┬────────┘
-     │                                                     │
-     │◄── POST /api/webhooks/docai/progress ───────────────┘
+     ├── POST /v1/jobs/extraction ─────────────────► citizen-link-docai
+     │   202 Accepted (fire and forget)                       │
+     │                                             ┌──────────────────────┐
+     │                                             │      ARQ Worker      │
+     │                                             │                      │
+     │                                             │  run_stage("VISION") │
+     │                                             │    ↓ gate check      │
+     │                                             │  run_stage("STRUCT") │
+     │                                             └──────────┬───────────┘
+     │                                                        │
+     │◄── POST /api/webhooks/docai/progress ──────────────────┘
      │    VISION (in_progress) then COMPLETED (with full result)
      │
      │   [user reviews fields, confirms]
@@ -88,12 +93,45 @@ NestJS (business logic)
 |---|---|
 | **ARQ** (not BullMQ) | Async-native Python (asyncio coroutines). No BullMQ Python port needed. Internal queue — no cross-service sharing. |
 | **asyncpg + raw SQL** | Fast, explicit, no ORM overhead. Alembic handles migrations. |
+| **Generic job model** (`job_type + input JSONB`) | Any pipeline stores its input in JSONB. New pipelines need no schema changes. |
+| **Pipeline registry** | `PipelineConfig` declares stages, gates, and result shape. One `run_stage` task handles all pipelines. |
+| **Typed endpoints per pipeline** | `POST /v1/jobs/extraction` validates extraction-specific fields. Future pipelines get their own endpoints. Internal model is generic. |
 | **Webhook delivery via ARQ** | `task_deliver_webhook` is itself an ARQ task — ARQ retries it automatically on failure. Every attempt logged to `webhook_deliveries`. |
 | **Own PostgreSQL** | Fully autonomous — no shared schema with NestJS. No caller IDs stored here at all. |
 | **Pre-signed S3 URLs** | Caller generates URLs before calling docai. docai downloads via plain httpx — no S3 SDK needed here. |
 | **Multi-turn agent correction** | Each failed round appends the LLM's bad output as `assistant` and the validation errors as `user`. The model sees its own failure history and corrects itself. |
 | **Per-job webhook URL** | `webhook_url` is part of the job request body — one docai instance can serve multiple independent callers. |
 | **JSONB for variable fields** | Result data, usage metrics, and conversation metadata live in JSONB columns. New fields never require a migration. |
+| **Pydantic models + dataclasses** | All agent I/O uses typed models (`VisionOutput`, `StructureOutput`) and dataclasses (`UsageEntry`, `ConversationEntry`). No raw `dict` passing — full autocomplete and compile-time checks. |
+
+---
+
+## Pipeline Registry
+
+All pipeline configuration lives in `app/pipeline/registry.py`. The single `run_stage` ARQ task dispatches to the correct agent by looking up `(job_type, stage)` in the registry — no `if/elif` logic in the task runner.
+
+```python
+PIPELINES: dict[str, PipelineConfig] = {
+    "EXTRACTION": PipelineConfig(
+        stages          = ["VISION", "STRUCTURE"],
+        progress_stages = {"VISION"},          # fires a mid-pipeline webhook
+        build_result    = _build_extraction_result,
+        post_stage_gate = {"VISION": _gate_vision_quality},
+    ),
+    # Future pipelines slot in here:
+    # "FRAUD_DETECTION":    PipelineConfig(stages=["FRAUD"],  build_result=...),
+    # "MATCH_VERIFICATION": PipelineConfig(stages=["MATCH"],  build_result=...),
+}
+```
+
+**`PipelineConfig` fields:**
+
+| Field | Type | Purpose |
+|---|---|---|
+| `stages` | `list[str]` | Ordered stage names — `run_stage` dispatches left-to-right |
+| `progress_stages` | `set[str]` | Subset that fire a mid-pipeline progress webhook (no result payload) |
+| `build_result` | `callable` | Assembles the `COMPLETED` webhook payload from all stage results |
+| `post_stage_gate` | `dict[stage → callable]` | Rule-based fast-fail checks run after a stage succeeds, before the next stage is enqueued |
 
 ---
 
@@ -103,13 +141,13 @@ Both `VisionAgent` and `StructureAgent` maintain a proper multi-turn conversatio
 
 ```
 Round 1:
-  system    → "You are a pure OCR engine..."
+  system    → "You are a document reader. You observe and transcribe..."
   user      → [extraction instructions + image]
 
-  → LLM responds with bad output
+  → LLM responds with bad output (e.g. wrong schema)
 
 Round 2:
-  system    → "You are a pure OCR engine..."
+  system    → "You are a document reader..."
   user      → [extraction instructions + image]   ← same initial ask
   assistant → "{...bad output from round 1...}"   ← what it actually said
   user      → "Your output had these errors: [...]. Please correct."
@@ -119,42 +157,60 @@ Round 2:
 Round 3 (if needed):
   system    → ...
   user      → [initial ask]
-  assistant → "{...bad output round 1...}"
+  assistant → "{...round 1 output...}"
   user      → "Errors: [...]"
-  assistant → "{...bad output round 2...}"
+  assistant → "{...round 2 output...}"
   user      → "Still invalid. Errors: [...]. Please correct."
 
 After MAX_AGENT_ITERATIONS failures:
   → AgentExhaustedError raised (carries full conversation trail)
   → FAILED stage row stored with all rounds
-  → FAILED webhook sent to caller: { failedAt: "VISION|STRUCTURE", reason: "..." }
+  → FAILED webhook sent: { failedAt: "VISION|STRUCTURE", reason: "..." }
 ```
 
 Every round — whether it succeeds or fails — is persisted to `stage_conversations` so you have a complete audit trail of how the model arrived at its output (or why it couldn't).
+
+### Vision Agent — what it extracts
+
+`VisionAgent` is deliberately unstructured. It has two jobs per page:
+
+1. **Text** — verbatim transcription of every visible character, preserving casing, punctuation, and line breaks. No interpretation. `[...]` for illegible portions.
+2. **Visual elements** — plain-English prose descriptions of non-text elements that carry identity significance: national symbols (flags, coats of arms), biometric elements (photographs, fingerprints, signatures), security features (stamps, holograms, MRZ strips).
+
+Pages are processed **in parallel** (`asyncio.gather`) — total latency = slowest page, not the sum of all pages. Each page has its own isolated correction loop.
+
+`fullText` and `averageConfidence` are computed deterministically from the page results — never asked from the LLM.
+
+### Structure Agent — what it extracts
+
+`StructureAgent` receives the full `VisionOutput` (all pages, text + visual element descriptions) and extracts typed, validated identity fields. All interpretation happens here — VisionAgent deliberately does none. It uses the visual element descriptions to determine biometrics presence (photo, fingerprint, signature) and country hints (flag descriptions).
 
 ---
 
 ## Pipeline Stages
 
 ```
-POST /v1/process received
+POST /v1/jobs/extraction received
          │
          ▼
-  Create processing_jobs row (PENDING)
-  Enqueue: run_vision
+  Create processing_jobs row (PENDING, job_type="EXTRACTION")
+  Enqueue: run_stage(job_id, "VISION")
          │
          ▼
-[ARQ Worker] run_vision
+[ARQ Worker] run_stage("VISION")
   → Download images via pre-signed URLs
-  → VisionAgent: multi-turn LLM conversation, max N rounds
+  → VisionAgent: parallel page extraction, multi-turn correction per page
   → Store processing_stages row (VISION / SUCCESS or FAILED)
-  → Store stage_conversations rows (one per LLM call)
+  → Store stage_conversations rows (one per LLM call per page)
+  → Post-stage gate check (OCR confidence + text length)
+      → gate passes: continue
+      → gate fails:  mark FAILED, send FAILED webhook, stop (no retry)
   → Send VISION webhook { stage: "VISION", status: "in_progress" }  ← progress signal only
-  → Enqueue: run_structure
+  → Enqueue: run_stage(job_id, "STRUCTURE")
          │
          ▼
-[ARQ Worker] run_structure
-  → Read VISION result from processing_stages
+[ARQ Worker] run_stage("STRUCTURE")
+  → Read VISION result from processing_stages (plain dict from DB JSONB)
   → StructureAgent: multi-turn LLM conversation, max N rounds
   → Store processing_stages row (STRUCTURE / SUCCESS or FAILED)
   → Store stage_conversations rows
@@ -172,10 +228,41 @@ POST /v1/process received
   → Store processing_stages row (status: FAILED, error: reason)
   → Store stage_conversations rows (all rounds attempted)
   → Mark job: FAILED
-  → Send FAILED webhook { stage: "FAILED", failedAt: "VISION|STRUCTURE", reason: "..." }
+  → Send FAILED webhook { failedAt: "VISION|STRUCTURE", reason: "..." }
 ```
 
-**Future stages** (fraud detection, quality scoring, etc.) slot between `run_structure` and the COMPLETED signal without any caller contract changes. See [Adding a New Pipeline Stage](#adding-a-new-pipeline-stage).
+**Future pipelines** register in `app/pipeline/registry.py` and slot in automatically — no changes to `run_stage`, no worker changes. See [Adding a New Pipeline](#adding-a-new-pipeline).
+
+---
+
+## Post-Stage Quality Gate
+
+After each stage succeeds, before the next stage is enqueued, the pipeline registry can run a rule-based gate function. Gates are declared per-stage in `PipelineConfig.post_stage_gate`.
+
+### VISION gate (`_gate_vision_quality`)
+
+Two fast checks — no LLM call, no token cost:
+
+| Check | Threshold | Meaning |
+|---|---|---|
+| `averageConfidence` | `< 0.40` | Image is physically unreadable (blur, damage, bad lighting). Structure agent would be extracting from noise. |
+| `len(fullText.strip())` | `< 25 chars` | Almost no text detected — blank upload, solid-colour screenshot, landscape photo, or anything that is not a document. |
+
+When a gate fails:
+- The job is marked `FAILED` immediately
+- A `FAILED` webhook is sent with a user-friendly `reason` string — the caller can forward this directly to the user
+- No retry is attempted (this is an expected business outcome, not an infrastructure failure)
+- No STRUCTURE LLM call is made — zero wasted tokens
+
+**Tuning thresholds:**
+
+```python
+# app/pipeline/registry.py
+_MIN_OCR_CONFIDENCE = 0.40   # adjust based on operational experience with your vision model
+_MIN_TEXT_LENGTH    = 25     # below this, not enough text for meaningful field extraction
+```
+
+These are conservative starting values. After observing real traffic distribution, tighten or loosen them without touching any logic.
 
 ---
 
@@ -185,13 +272,13 @@ POST /v1/process received
 |---|---|---|---|
 | `GET` | `/health` | None | Liveness — always 200 if the process is alive |
 | `GET` | `/health/ready` | None | Readiness — checks DB (`SELECT 1`) + Redis (`PING`) |
-| `POST` | `/v1/process` | `X-Internal-Secret` + `X-User-Id` | Submit an extraction job |
-| `GET` | `/v1/jobs` | `X-Internal-Secret` + `X-User-Id` | List all jobs (optional status filter + pagination) |
-| `GET` | `/v1/jobs/{jobId}` | `X-Internal-Secret` + `X-User-Id` | Poll a single job status |
+| `POST` | `/v1/jobs/extraction` | `X-Internal-Secret` | Submit a document extraction job |
+| `GET` | `/v1/jobs` | `X-Internal-Secret` | List jobs (optional `job_type` + `status` filters + pagination) |
+| `GET` | `/v1/jobs/{jobId}` | `X-Internal-Secret` | Poll a single job status |
 | `POST` | `/v1/embed` | `X-Internal-Secret` | Generate an embedding vector |
 | `GET` | `/docs` | None | Swagger UI (disable in production) |
 
-### POST /v1/process
+### POST /v1/jobs/extraction
 
 **Request:**
 ```json
@@ -201,13 +288,17 @@ POST /v1/process received
     "https://minio.example.com/tmp/doc-page1.jpg?X-Amz-Signature=...",
     "https://minio.example.com/tmp/doc-page2.jpg?X-Amz-Signature=..."
   ],
-  "webhook_url": "http://caller-server:2000/api/webhooks/docai/progress"
+  "webhook_url": "http://caller-server:2000/api/webhooks/docai/progress",
+  "priority": 5
 }
 ```
 
-- `case_number` — human-readable reference used for logging and image path organisation
-- `image_urls` — pre-signed MinIO/S3 URLs (caller generates these; docai downloads via plain HTTP)
-- `webhook_url` — where docai POSTs stage callbacks
+| Field | Required | Description |
+|---|---|---|
+| `case_number` | ✅ | Human-readable reference used for logging |
+| `image_urls` | ✅ | Pre-signed MinIO/S3 URLs (caller generates; docai downloads via plain HTTP). Min 1 URL. |
+| `webhook_url` | ✅ | Where docai POSTs stage callbacks |
+| `priority` | — | 1 (highest) – 10 (lowest), default `5` |
 
 **Response (202):**
 ```json
@@ -220,7 +311,14 @@ The caller stores `job_id` as `AIExtraction.docaiJobId` so webhooks can be match
 
 ### GET /v1/jobs
 
-Optional query params: `status` (PENDING, IN_PROGRESS, COMPLETED, FAILED), `page` (default 1), `page_size` (default 20, max 100).
+Optional query params:
+
+| Param | Description |
+|---|---|
+| `job_type` | Filter by pipeline type (e.g. `EXTRACTION`) |
+| `status` | Filter by status: `PENDING`, `IN_PROGRESS`, `COMPLETED`, `FAILED` |
+| `page` | Default `1` |
+| `page_size` | Default `20`, max `100` |
 
 ### POST /v1/embed
 
@@ -265,7 +363,7 @@ docai POSTs to the job's `webhook_url` with `X-Internal-Secret: <CALLBACK_SECRET
 |---|---|---|
 | `VISION` | `in_progress` | `null` — progress signal only, no result data |
 | `COMPLETED` | `completed` | `{ fields, ocrConfidence, extractionConfidence }` |
-| `FAILED` | `failed` | `{ failedAt: "VISION\|STRUCTURE", reason: "error message" }` |
+| `FAILED` | `failed` | `{ failedAt: "VISION\|STRUCTURE", reason: "user-friendly error message" }` |
 
 **Caller validates the `X-Internal-Secret` header on every incoming webhook.**
 
@@ -275,11 +373,13 @@ docai POSTs to the job's `webhook_url` with `X-Internal-Secret: <CALLBACK_SECRET
 {
   "fields": {
     "documentType": { "code": "NATIONAL_ID", "confidence": 0.97 },
+    "country": "KE",
     "person": {
       "fullName": "JOHN KAMAU DOE",
       "surname": "DOE",
       "givenNames": ["JOHN", "KAMAU"],
       "dateOfBirth": "1990-05-15",
+      "placeOfBirth": "NAIROBI",
       "gender": "Male"
     },
     "document": {
@@ -288,6 +388,18 @@ docai POSTs to the job's `webhook_url` with `X-Internal-Secret: <CALLBACK_SECRET
       "issueDate": "2015-03-20",
       "expiryDate": null
     },
+    "address": {
+      "raw": "P.O. BOX 1234, NAIROBI",
+      "country": "KE",
+      "components": [{ "type": "city", "value": "NAIROBI" }]
+    },
+    "biometrics": {
+      "photoPresent": true,
+      "fingerprintPresent": true,
+      "signaturePresent": false
+    },
+    "additionalFields": [],
+    "raw": { "pagesReferenced": [1, 2] },
     "quality": {
       "ocrConfidence": 0.91,
       "extractionConfidence": 0.88,
@@ -299,6 +411,15 @@ docai POSTs to the job's `webhook_url` with `X-Internal-Secret: <CALLBACK_SECRET
 }
 ```
 
+### FAILED gate result shape
+
+```json
+{
+  "failedAt": "VISION",
+  "reason": "Document image quality is too poor to process (OCR confidence 23% — minimum 40%). Please upload a clearer, well-lit image of the document."
+}
+```
+
 ---
 
 ## Database Schema
@@ -306,16 +427,17 @@ docai POSTs to the job's `webhook_url` with `X-Internal-Secret: <CALLBACK_SECRET
 docai has its own PostgreSQL database — completely separate from NestJS. No caller IDs are stored here. The caller stores `job_id` on its own `AIExtraction` record to match incoming webhooks.
 
 ### `processing_jobs`
-Tracks the lifecycle of each extraction job.
+Tracks the lifecycle of each job. The `input` JSONB column holds pipeline-specific parameters (e.g. `{case_number, image_urls}` for EXTRACTION) — new pipelines need no schema changes.
 
 ```sql
 processing_jobs (
   id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  case_number   TEXT        NOT NULL,
-  image_urls    TEXT[]      NOT NULL,
+  job_type      TEXT        NOT NULL,                      -- 'EXTRACTION' | future types
+  input         JSONB       NOT NULL,                      -- pipeline-specific parameters
   webhook_url   TEXT        NOT NULL,
-  status        TEXT        NOT NULL DEFAULT 'PENDING',  -- PENDING | IN_PROGRESS | COMPLETED | FAILED
-  current_stage TEXT,                                    -- VISION | STRUCTURE | null
+  priority      INT         NOT NULL DEFAULT 5,            -- 1 (highest) to 10 (lowest)
+  status        TEXT        NOT NULL DEFAULT 'PENDING',    -- PENDING | IN_PROGRESS | COMPLETED | FAILED
+  current_stage TEXT,                                      -- VISION | STRUCTURE | null
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
@@ -399,11 +521,12 @@ citizen-link-docai/
 │   ├── env.py                       # Reads DATABASE_URL from env, no ORM
 │   ├── alembic.ini
 │   └── versions/
-│       ├── 001_initial_schema.py    # Base schema
-│       ├── 002_slim_processing_jobs.py      # Remove external_* fields
+│       ├── 001_initial_schema.py              # Base schema
+│       ├── 002_slim_processing_jobs.py        # Remove external_* fields
 │       ├── 003_extraction_conversation_trail.py  # (superseded by 005)
-│       ├── 004_processing_stages.py         # Replace extraction_results + ai_usage_logs
-│       └── 005_stage_conversations_table.py # Dedicated conversation rows table
+│       ├── 004_processing_stages.py           # Replace extraction_results + ai_usage_logs
+│       ├── 005_stage_conversations_table.py   # Dedicated conversation rows table
+│       └── 006_generic_job_input.py           # job_type + input JSONB + priority (replaces case_number + image_urls)
 │
 └── app/
     ├── config.py                    # pydantic-settings — all env vars, one source of truth
@@ -413,11 +536,17 @@ citizen-link-docai/
     ├── exceptions.py                # AppError hierarchy + FastAPI exception handlers
     ├── health.py                    # GET /health (liveness) + GET /health/ready (DB + Redis)
     │
+    ├── models/                      # Typed domain models — no raw dicts in agent I/O
+    │   ├── __init__.py              # Barrel exports
+    │   ├── vision.py                # VisionMeta, VisionPage, VisionOutput (Pydantic)
+    │   ├── structure.py             # StructureOutput + nested models (Pydantic)
+    │   └── pipeline.py              # ConversationEntry, UsageEntry, UsageSummary, JobRecord (dataclasses)
+    │
     ├── processing/                  # Job intake
-    │   ├── schemas.py               # ProcessRequest, JobStatusResponse, JobListResponse
+    │   ├── schemas.py               # ExtractionRequest, JobStatusResponse, JobListResponse
     │   ├── repository.py            # Raw SQL on processing_jobs
-    │   ├── service.py               # Create job + enqueue run_vision to ARQ
-    │   └── router.py                # POST /v1/process, GET /v1/jobs, GET /v1/jobs/{id}
+    │   ├── service.py               # submit_extraction() — creates job + enqueues run_stage
+    │   └── router.py                # POST /v1/jobs/extraction, GET /v1/jobs, GET /v1/jobs/{id}
     │
     ├── embedding/                   # Embedding endpoint (caller-initiated, post-confirmation)
     │   ├── schemas.py               # EmbedRequest, EmbedResponse
@@ -426,15 +555,16 @@ citizen-link-docai/
     │
     ├── agents/                      # Agentic LLM processors with multi-turn correction loop
     │   ├── exceptions.py            # AgentExhaustedError — carries conversation trail on failure
-    │   ├── vision_agent.py          # Image URLs → validated OCR output (max N rounds)
-    │   └── structure_agent.py       # OCR output → validated document fields (max N rounds)
+    │   ├── vision_agent.py          # Image URLs → VisionOutput (parallel pages, max N rounds each)
+    │   └── structure_agent.py       # VisionOutput → StructureOutput (max N rounds)
     │
     └── pipeline/                    # Internal async job queue
-        ├── enums.py                 # WebhookStage, WebhookStatus, JobStatus, PipelineStage
-        ├── tasks.py                 # ARQ coroutines: run_vision, run_structure,
-        │                            #   task_deliver_webhook
+        ├── enums.py                 # WebhookStage, WebhookStatus, JobStatus, StageStatus, JobType
+        ├── registry.py              # PipelineConfig, PIPELINES dict, get_pipeline(), get_agent()
+        │                            # Post-stage gates: _gate_vision_quality
+        ├── tasks.py                 # ARQ coroutines: run_stage, task_deliver_webhook
         │                            # Helpers: _store_stage, _store_conversation,
-        │                            #   _get_stage_result, _build_usage, _notify_failure
+        │                            #   _get_stage_result, _notify_failure
         ├── worker.py                # WorkerSettings — registers tasks, startup/shutdown hooks
         └── webhook.py               # HTTP delivery to caller + webhook_deliveries logging
 ```
@@ -605,9 +735,8 @@ curl -X POST http://localhost:8002/v1/embed \
 ### Submitting a test extraction job
 
 ```bash
-curl -X POST http://localhost:8002/v1/process \
+curl -X POST http://localhost:8002/v1/jobs/extraction \
   -H "X-Internal-Secret: your-secret" \
-  -H "X-User-Id: test-user-id" \
   -H "Content-Type: application/json" \
   -d '{
     "case_number": "CL-2025-00001",
@@ -622,12 +751,10 @@ curl -X POST http://localhost:8002/v1/process \
 
 ```bash
 curl http://localhost:8002/v1/jobs/<job_id> \
-  -H "X-Internal-Secret: your-secret" \
-  -H "X-User-Id: test-user-id"
+  -H "X-Internal-Secret: your-secret"
 
-curl "http://localhost:8002/v1/jobs?status=COMPLETED&page=1&page_size=20" \
-  -H "X-Internal-Secret: your-secret" \
-  -H "X-User-Id: test-user-id"
+curl "http://localhost:8002/v1/jobs?job_type=EXTRACTION&status=COMPLETED&page=1&page_size=20" \
+  -H "X-Internal-Secret: your-secret"
 ```
 
 ### Inspecting stage results and usage
@@ -673,52 +800,69 @@ docker compose exec db psql -U docai -d citizen-link-docai \
 
 ---
 
-## Adding a New Pipeline Stage
+## Adding a New Pipeline
 
-Future stages (fraud detection, quality scoring, etc.) slot between `run_structure` and the COMPLETED signal without changing the caller contract.
+New pipelines register in `app/pipeline/registry.py` and get a typed endpoint in `app/processing/router.py`. No changes to `run_stage`, no worker changes, no schema migrations.
 
-1. **Write the task coroutine** in `app/pipeline/tasks.py`:
-   ```python
-   async def run_quality_check(ctx: dict, job_id: str) -> None:
-       pool = ctx["pool"]
-       settings = ctx["settings"]
-       started_at = datetime.now(timezone.utc)
+### 1. Write the agent
 
-       repo = ProcessingRepository(pool)
-       job = await repo.get_job(job_id)
-       await repo.update_status(job_id, "IN_PROGRESS", current_stage="QUALITY_CHECK")
+```python
+# app/agents/fraud_agent.py
+class FraudAgent:
+    async def run(
+        self,
+        job_input: dict,
+        previous_results: dict[str, dict],
+    ) -> tuple[FraudOutput, list[UsageEntry], list[ConversationEntry]]:
+        ...
+```
 
-       try:
-           # ... your logic ...
-           await _store_stage(pool, job_id, "QUALITY_CHECK", status="SUCCESS", result={...}, started_at=started_at)
-           await _enqueue_next(settings, "run_structure", job_id)
-       except Exception as exc:
-           await _store_stage(pool, job_id, "QUALITY_CHECK", status="FAILED", error=str(exc), started_at=started_at)
-           await _notify_failure(pool, settings, job_id, "QUALITY_CHECK", str(exc), job)
-           raise
-   ```
+### 2. Register in the registry
 
-2. **Register it** in `app/pipeline/worker.py`:
-   ```python
-   from app.pipeline.tasks import run_quality_check
+```python
+# app/pipeline/registry.py
 
-   class WorkerSettings:
-       functions = [
-           run_vision,
-           run_quality_check,   # ← add here
-           run_structure,
-           task_deliver_webhook,
-       ]
-   ```
+def _make_fraud_agent(settings: Settings) -> Any:
+    from app.agents.fraud_agent import FraudAgent
+    return FraudAgent(settings)
 
-3. **Update the handoff** — in `run_vision`, change:
-   ```python
-   await _enqueue_next(settings, "run_structure", job_id)
-   # to:
-   await _enqueue_next(settings, "run_quality_check", job_id)
-   ```
+_AGENT_FACTORIES = {
+    ("EXTRACTION", "VISION"):       _make_vision_agent,
+    ("EXTRACTION", "STRUCTURE"):    _make_structure_agent,
+    ("FRAUD_DETECTION", "FRAUD"):   _make_fraud_agent,   # ← new
+}
 
-4. **No caller contract changes.** The caller still fires `POST /v1/process` and still receives COMPLETED with the full result.
+PIPELINES = {
+    "EXTRACTION": PipelineConfig(...),
+    "FRAUD_DETECTION": PipelineConfig(         # ← new
+        stages       = ["FRAUD"],
+        build_result = _build_fraud_result,
+    ),
+}
+```
+
+### 3. Add a typed endpoint
+
+```python
+# app/processing/router.py
+
+class FraudRequest(BaseModel):
+    document_id: str
+    image_urls: list[str]
+    webhook_url: str
+
+@router.post("/jobs/fraud-detection", status_code=202)
+async def submit_fraud_detection(request: FraudRequest, ...):
+    job_input = {"document_id": request.document_id, "image_urls": request.image_urls}
+    job_id = await service.submit(
+        job_type="FRAUD_DETECTION",
+        job_input=job_input,
+        webhook_url=request.webhook_url,
+    )
+    return {"job_id": job_id}
+```
+
+That's it. `run_stage` picks up `FRAUD_DETECTION` jobs automatically via the registry. The caller contract — `POST typed-endpoint → 202 → webhooks → COMPLETED` — is unchanged.
 
 ---
 
@@ -791,16 +935,19 @@ curl -X POST http://localhost:8002/v1/embed \
 docker compose exec db psql -U docai -d citizen-link-docai -c "\dt"
 # Expected: processing_jobs, processing_stages, stage_conversations, webhook_deliveries
 
-# 6. Submit a test job and trace it through the pipeline
-curl -X POST http://localhost:8002/v1/process \
+# 6. processing_jobs has the correct columns (job_type, input, priority — not case_number/image_urls)
+docker compose exec db psql -U docai -d citizen-link-docai \
+  -c "\d processing_jobs"
+
+# 7. Submit a test extraction job and trace it through the pipeline
+curl -X POST http://localhost:8002/v1/jobs/extraction \
   -H "X-Internal-Secret: $INTERNAL_SECRET" \
-  -H "X-User-Id: test" \
   -H "Content-Type: application/json" \
   -d '{"case_number":"TEST-001","image_urls":["https://..."],"webhook_url":"http://..."}'
 
 # Then watch it flow:
 docker compose exec db psql -U docai -d citizen-link-docai \
-  -c "SELECT status, current_stage, updated_at FROM processing_jobs ORDER BY created_at DESC LIMIT 1;"
+  -c "SELECT job_type, status, current_stage, updated_at FROM processing_jobs ORDER BY created_at DESC LIMIT 1;"
 
 docker compose exec db psql -U docai -d citizen-link-docai \
   -c "SELECT stage, status, error, usage->>'total_input_tokens' AS tokens
