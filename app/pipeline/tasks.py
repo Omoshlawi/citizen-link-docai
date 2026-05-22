@@ -4,13 +4,22 @@ ARQ pipeline tasks — generic stage runner + webhook delivery.
 Pipeline flow (EXTRACTION):
   run_stage("VISION") → run_stage("STRUCTURE")
 
-Caller webhook contract:
-  VISION    — OCR complete, extraction in progress (progress signal, no result data)
-  COMPLETED — all extraction done, full fields delivered (terminal signal)
-  FAILED    — a stage failed, includes which stage and the reason
+Caller webhook contract (event-based, dot-notation):
+  {ns}.{stage}.success  — stage completed; payload is that stage's raw output
+  {ns}.success          — all stages done; payload is nested { stage: result, ... }
+  {ns}.{stage}.failed   — stage failed (terminal); payload is { reason }
+  {ns}.failed           — flat rollup failure (fires alongside stage event);
+                          payload is { failedAt, reason }
 
-New pipelines (fraud detection, match verification, etc.) register in
-app/pipeline/registry.py and slot in automatically — no changes needed here.
+Example for EXTRACTION:
+  extraction.vision.success      → { averageConfidence, fullText, … }
+  extraction.structure.success   → { documentType, person, document, … }
+  extraction.success             → { vision: {…}, structure: {…} }   ← terminal happy path
+  extraction.vision.failed       → { reason }                         ← terminal, gate rejected
+  extraction.structure.failed    → { reason }                         ← terminal, agent failed
+  extraction.failed              → { failedAt, reason }               ← terminal rollup
+
+New pipelines register in app/pipeline/registry.py — no changes needed here.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import structlog
 from app.agents.exceptions import AgentExhaustedError
 from app.config import Settings
 from app.models.pipeline import ConversationEntry, JobRecord, UsageSummary
-from app.pipeline.enums import JobStatus, StageStatus, WebhookStatus
+from app.pipeline.enums import DocaiEvent, JobStatus, StageStatus
 from app.pipeline.webhook import deliver_webhook
 from app.processing.repository import ProcessingRepository
 
@@ -119,20 +128,32 @@ async def _notify_failure(
     pool: asyncpg.Pool,
     settings: Settings,
     job_id: str,
+    namespace: str,
     failed_at: str,
     reason: str,
     job: JobRecord,
 ) -> None:
-    """Mark the job FAILED and fire the failure webhook. Stage row must already exist."""
+    """
+    Mark the job FAILED and enqueue two failure webhooks:
+      1. {namespace}.{stage}.failed  — stage-specific, payload { reason }
+      2. {namespace}.failed          — flat rollup,      payload { failedAt, reason }
+
+    Stage row must already exist before calling this.
+    """
+    stage_event  = DocaiEvent(f"{namespace}.{failed_at.lower()}.failed")
+    rollup_event = DocaiEvent(f"{namespace}.failed")
+
     await ProcessingRepository(pool).update_status(job_id, JobStatus.FAILED)
+
     await _enqueue_webhook(
-        pool=pool,
-        settings=settings,
-        job_id=job_id,
-        stage="FAILED",
-        status=WebhookStatus.FAILED,
-        callback_url=job.webhook_url,
-        result={"failedAt": failed_at, "reason": reason},
+        pool=pool, settings=settings, job_id=job_id,
+        event=stage_event, callback_url=job.webhook_url,
+        result={"reason": reason},
+    )
+    await _enqueue_webhook(
+        pool=pool, settings=settings, job_id=job_id,
+        event=rollup_event, callback_url=job.webhook_url,
+        result={"failedAt": failed_at.lower(), "reason": reason},
     )
 
 
@@ -142,8 +163,7 @@ async def _enqueue_webhook(
     pool: asyncpg.Pool,
     settings: Settings,
     job_id: str,
-    stage: str,
-    status: WebhookStatus,
+    event: DocaiEvent,
     callback_url: str,
     result: Optional[dict] = None,
 ) -> None:
@@ -154,8 +174,7 @@ async def _enqueue_webhook(
     await arq_pool.enqueue_job(
         "task_deliver_webhook",
         job_id,
-        stage,
-        status,
+        event,
         callback_url,
         settings.callback_secret,
         result,
@@ -179,8 +198,9 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
     Generic ARQ task — runs one pipeline stage for any job type.
 
     Dispatches to the correct agent via the pipeline registry, stores the
-    result, fires a progress webhook if this is a mid-pipeline stage, then
-    either enqueues the next stage or fires the terminal COMPLETED webhook.
+    result, always fires a {namespace}.{stage}.success event with the raw
+    stage output, then either enqueues the next stage or fires the terminal
+    {namespace}.success event with the nested combined result.
     """
     from app.pipeline.registry import get_agent, get_pipeline
 
@@ -236,36 +256,41 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
 
         # Post-stage gate — rule-based fast-fail before spending tokens on next stage.
         # Only checked when a subsequent stage exists; the final stage is never gated.
+        # Post-stage gate — fast-fail before spending tokens on next stage.
+        # Runs before the success event so a gate rejection never fires *.success.
         if has_next:
             gate = pipeline.post_stage_gate.get(stage)
             if gate:
                 gate_error = gate(result_model.to_dict())
                 if gate_error:
                     log.warning("stage_gate_failed", stage=stage, reason=gate_error)
-                    await _notify_failure(pool, settings, job_id, stage, gate_error, job)
+                    await _notify_failure(pool, settings, job_id, pipeline.namespace, stage, gate_error, job)
                     return  # expected business outcome — no retry, no exception
 
-        if stage in pipeline.progress_stages and has_next:
-            await _enqueue_webhook(
-                pool=pool, settings=settings, job_id=job_id,
-                stage=stage, status=WebhookStatus.IN_PROGRESS,
-                callback_url=job.webhook_url,
-            )
+        # Always fire a per-stage success event with the raw stage output.
+        stage_success_event = DocaiEvent(f"{pipeline.namespace}.{stage.lower()}.success")
+        await _enqueue_webhook(
+            pool=pool, settings=settings, job_id=job_id,
+            event=stage_success_event,
+            callback_url=job.webhook_url,
+            result=result_model.to_dict(),
+        )
 
         if has_next:
             next_stage = pipeline.stages[next_index]
             log.info("enqueueing_next_stage", next_stage=next_stage)
             await _enqueue_next(settings, "run_stage", job_id, next_stage)
         else:
+            # Final stage — fire the terminal {namespace}.success with the nested combined result.
             all_results = {**previous_results, stage: result_model.to_dict()}
-            final_result = pipeline.build_result(all_results)
+            pipeline_success_event = DocaiEvent(f"{pipeline.namespace}.success")
 
             await repo.update_status(job_id, JobStatus.COMPLETED, current_stage=None)
             await _enqueue_webhook(
                 pool=pool, settings=settings, job_id=job_id,
-                stage="COMPLETED", status=WebhookStatus.COMPLETED,
+                event=pipeline_success_event,
                 callback_url=job.webhook_url,
-                result=final_result,
+                result=pipeline.build_result(all_results),
             )
             log.info("pipeline_completed", job_type=job.job_type)
 
@@ -278,7 +303,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
             started_at=started_at,
         )
         await _store_conversation(pool, stage_id, job_id, exc.conversation)
-        await _notify_failure(pool, settings, job_id, stage, str(exc), job)
+        await _notify_failure(pool, settings, job_id, pipeline.namespace, stage, str(exc), job)
         raise
 
     except Exception as exc:
@@ -289,7 +314,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
             error=str(exc),
             started_at=started_at,
         )
-        await _notify_failure(pool, settings, job_id, stage, str(exc), job)
+        await _notify_failure(pool, settings, job_id, pipeline.namespace, stage, str(exc), job)
         raise
 
 
@@ -298,8 +323,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
 async def task_deliver_webhook(
     ctx: dict,
     job_id: str,
-    stage: str,
-    status: WebhookStatus,
+    event: DocaiEvent,
     callback_url: str,
     callback_secret: str,
     result: Optional[dict] = None,
@@ -313,14 +337,13 @@ async def task_deliver_webhook(
     pool: asyncpg.Pool = ctx["pool"]
     attempt = ctx.get("job_try", 1)
 
-    structlog.contextvars.bind_contextvars(job_id=job_id, stage=stage)
+    structlog.contextvars.bind_contextvars(job_id=job_id, event=event)
     log.info("webhook_task_started", attempt=attempt)
 
     await deliver_webhook(
         pool=pool,
         job_id=job_id,
-        stage=stage,
-        status=status,
+        event=event,
         callback_url=callback_url,
         callback_secret=callback_secret,
         result=result,

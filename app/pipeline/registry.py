@@ -8,17 +8,21 @@ Adding a new pipeline (e.g. fraud detection) means:
 
 PipelineConfig fields
 ---------------------
-stages           — ordered list of stage names (e.g. ["VISION", "STRUCTURE"])
-progress_stages  — subset of stages that fire a mid-pipeline progress webhook
-                   (non-terminal, no result payload).  Terminal COMPLETED is
-                   always fired after the last stage by run_stage.
-build_result     — callable: {stage_name: result_dict} → COMPLETED webhook payload.
-                   Called only after the final stage succeeds.
+namespace        — dot-notation event prefix (e.g. "extraction", "fraud-detection").
+                   Events are constructed automatically:
+                     {namespace}.{stage.lower()}.success  — per-stage, carries raw result
+                     {namespace}.success                  — terminal, nested combined result
+                     {namespace}.{stage.lower()}.failed   — terminal stage failure
+                     {namespace}.failed                   — terminal flat rollup failure
+build_result     — callable: {stage_name: result_dict} → {namespace}.success payload.
+                   Called only after the final stage succeeds.  Should return a
+                   nested dict keyed by stage name so consumers can pick what they need.
 post_stage_gate  — callable per stage: result_dict → error_message | None.
                    Runs after a stage stores its SUCCESS result but before the
                    next stage is enqueued.  Returning a non-None string fails the
                    job immediately with that message — no retry, no further LLM
                    spend.  Only checked when a next stage exists.
+stages           — ordered list of stage names (e.g. ["VISION", "STRUCTURE"])
 """
 
 from __future__ import annotations
@@ -52,21 +56,24 @@ class AgentProtocol:
 class PipelineConfig:
     """Registry entry for one pipeline type."""
 
+    namespace: str
+    """
+    Dot-notation event prefix (e.g. "extraction", "fraud-detection").
+    run_stage constructs all event names from this automatically — no manual
+    event wiring needed when adding stages.
+    """
+
     stages: list[str]
     """Ordered stage names — run_stage dispatches them left-to-right."""
 
-    progress_stages: set[str] = field(default_factory=set)
-    """
-    Stages that fire a progress webhook (mid-pipeline, no result payload).
-    Terminal COMPLETED is always fired after the final stage by run_stage.
-    """
-
     build_result: Callable[[dict[str, dict]], dict] = field(
-        default_factory=lambda: (lambda _: {})
+        default_factory=lambda: (lambda results: results)
     )
     """
-    Build the COMPLETED webhook result dict from all stage results.
-    Called only after the final stage succeeds.
+    Build the {namespace}.success webhook payload from all stage results.
+    Called only after the final stage succeeds.  Return a dict nested by stage
+    name so consumers can pick what they need, e.g.:
+        { "vision": {...}, "structure": {...} }
     """
 
     post_stage_gate: dict[str, Callable[[dict], Optional[str]]] = field(
@@ -76,10 +83,11 @@ class PipelineConfig:
     Per-stage quality gates.  Each entry is:
         stage_name → callable(result_dict) → error_message | None
 
-    The gate runs after the stage stores its SUCCESS result, before the next
-    stage is enqueued.  A non-None return value fails the job immediately with
-    that message — no retry, no further LLM spend.  Gates are only checked when
-    a subsequent stage exists; the final stage is never gated (COMPLETED fires).
+    The gate runs after the stage stores its SUCCESS result, before the
+    stage success event fires or the next stage is enqueued.  A non-None
+    return value fails the job immediately — no retry, no further LLM spend.
+    Gates are only checked when a subsequent stage exists; the final stage
+    is never gated.
     """
 
 
@@ -130,13 +138,17 @@ def _gate_vision_quality(result: dict) -> Optional[str]:
 # ── EXTRACTION pipeline — result builder ──────────────────────────────────────
 
 def _build_extraction_result(stage_results: dict[str, dict]) -> dict:
-    """Assemble the COMPLETED webhook payload for EXTRACTION jobs."""
-    vision    = stage_results.get("VISION",    {})
-    structure = stage_results.get("STRUCTURE", {})
+    """
+    Assemble the extraction.success payload — nested by stage so consumers
+    pick exactly what they need.
+
+    Clients interested only in extracted fields read result.structure.
+    Clients wanting OCR confidence read result.vision.averageConfidence.
+    Clients wanting everything get it all in one place.
+    """
     return {
-        "fields":              structure,
-        "ocrConfidence":       vision.get("averageConfidence"),
-        "extractionConfidence": structure.get("quality", {}).get("extractionConfidence"),
+        "vision":    stage_results.get("VISION",    {}),
+        "structure": stage_results.get("STRUCTURE", {}),
     }
 
 
@@ -144,14 +156,14 @@ def _build_extraction_result(stage_results: dict[str, dict]) -> dict:
 
 PIPELINES: dict[str, PipelineConfig] = {
     "EXTRACTION": PipelineConfig(
+        namespace       = "extraction",
         stages          = ["VISION", "STRUCTURE"],
-        progress_stages = {"VISION"},
         build_result    = _build_extraction_result,
         post_stage_gate = {"VISION": _gate_vision_quality},
     ),
     # Future pipelines slot in here without any schema or task changes:
-    # "FRAUD_DETECTION":    PipelineConfig(stages=["FRAUD"],  build_result=...),
-    # "MATCH_VERIFICATION": PipelineConfig(stages=["MATCH"],  build_result=...),
+    # "FRAUD_DETECTION":    PipelineConfig(namespace="fraud-detection", stages=["CHECK"], build_result=...),
+    # "MATCH_VERIFICATION": PipelineConfig(namespace="match",           stages=["MATCH"], build_result=...),
 }
 
 

@@ -19,7 +19,7 @@ import asyncpg
 import httpx
 import structlog
 
-from app.pipeline.enums import WebhookStatus
+from app.pipeline.enums import DocaiEvent
 
 log = structlog.get_logger(__name__)
 
@@ -27,7 +27,7 @@ log = structlog.get_logger(__name__)
 async def _log_delivery(
     pool: asyncpg.Pool,
     job_id: str,
-    stage: str,
+    event: str,
     payload: dict,
     callback_url: str,
     response_status: Optional[int],
@@ -35,7 +35,7 @@ async def _log_delivery(
     attempt_count: int,
     delivered: bool,
 ) -> None:
-    """Insert one webhook_deliveries row."""
+    """Insert one webhook_deliveries row (stage column stores the full event string)."""
     await pool.execute(
         """
         INSERT INTO webhook_deliveries (
@@ -46,7 +46,7 @@ async def _log_delivery(
         VALUES ($1::uuid, $2, $3::jsonb, $4, $5, $6, $7, $8)
         """,
         job_id,
-        stage,
+        event,
         json.dumps(payload),
         callback_url,
         response_status,
@@ -59,8 +59,7 @@ async def _log_delivery(
 async def deliver_webhook(
     pool: asyncpg.Pool,
     job_id: str,
-    stage: str,
-    status: WebhookStatus,
+    event: DocaiEvent,
     callback_url: str,
     callback_secret: str,
     result: Optional[dict] = None,
@@ -74,8 +73,7 @@ async def deliver_webhook(
     """
     payload = {
         "jobId": job_id,
-        "stage": stage,
-        "status": status.value,
+        "event": event.value,
         "result": result,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -102,7 +100,7 @@ async def deliver_webhook(
         log.info(
             "webhook_delivered",
             job_id=job_id,
-            stage=stage,
+            event=event.value,
             status_code=response_status,
         )
 
@@ -110,7 +108,7 @@ async def deliver_webhook(
         log.error(
             "webhook_http_error",
             job_id=job_id,
-            stage=stage,
+            event=event.value,
             status_code=exc.response.status_code,
             attempt=attempt_count,
         )
@@ -120,7 +118,7 @@ async def deliver_webhook(
         log.error(
             "webhook_delivery_failed",
             job_id=job_id,
-            stage=stage,
+            event=event.value,
             error=str(exc),
             attempt=attempt_count,
         )
@@ -132,7 +130,7 @@ async def deliver_webhook(
             await _log_delivery(
                 pool=pool,
                 job_id=job_id,
-                stage=stage,
+                event=event.value,
                 payload=payload,
                 callback_url=callback_url,
                 response_status=response_status,
