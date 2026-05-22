@@ -40,7 +40,6 @@ DOCUMENT_TYPE_CODES = [
 ]
 
 VALID_WARNINGS = {
-    "LOW_OCR_CONFIDENCE",
     "DOCUMENT_TYPE_UNCERTAIN",
     "MULTIPLE_DOB_VALUES_FOUND",
     "MULTIPLE_ID_VALUES_FOUND",
@@ -49,6 +48,9 @@ VALID_WARNINGS = {
     "CONFLICTING_NAME_VALUES",
     "EXPIRED_DOCUMENT",
 }
+
+# Injected programmatically by _sanitize() — never emitted by the LLM
+_PROGRAMMATIC_WARNINGS = {"LOW_OCR_CONFIDENCE"}
 
 STRUCTURE_SYSTEM_PROMPT = (
     "You are a document understanding engine. "
@@ -124,7 +126,6 @@ SCORING RULES
 ---
 
 WARNING CODES (add to quality.warnings[] when applicable):
-- LOW_OCR_CONFIDENCE          → averageConfidence < 0.75
 - DOCUMENT_TYPE_UNCERTAIN     → could not confidently classify
 - MULTIPLE_DOB_VALUES_FOUND   → more than one date of birth detected
 - MULTIPLE_ID_VALUES_FOUND    → more than one ID number detected
@@ -172,7 +173,6 @@ Return ONLY valid JSON matching this exact schema. No markdown. No explanation.
     "pagesReferenced": [number]
   }},
   "quality": {{
-    "ocrConfidence": number,
     "extractionConfidence": number,
     "warnings": string[]
   }}
@@ -237,10 +237,9 @@ def _validate_structure_output(data: dict) -> list[str]:
     if not isinstance(quality, dict):
         errors.append("quality must be an object")
     else:
-        for f in ("ocrConfidence", "extractionConfidence"):
-            v = quality.get(f)
-            if not isinstance(v, (int, float)) or not (0 <= v <= 1):
-                errors.append(f"quality.{f} must be a decimal in [0, 1]")
+        v = quality.get("extractionConfidence")
+        if not isinstance(v, (int, float)) or not (0 <= v <= 1):
+            errors.append("quality.extractionConfidence must be a decimal in [0, 1]")
         warnings = quality.get("warnings", [])
         if not isinstance(warnings, list):
             errors.append("quality.warnings must be an array")
@@ -252,11 +251,13 @@ def _validate_structure_output(data: dict) -> list[str]:
     return errors
 
 
-def _sanitize(data: dict) -> dict:
+def _sanitize(data: dict, ocr_confidence: float) -> dict:
     """
     Fix edge cases before constructing StructureOutput:
     - Coerce unknown documentType.code to UNKNOWN
     - Round confidence values to 4dp
+    - Inject ocrConfidence from vision averageConfidence (never trust LLM for this)
+    - Add LOW_OCR_CONFIDENCE warning programmatically when ocrConfidence < 0.75
     - Strip invalid warning codes
     - Coerce pagesReferenced elements to int
     """
@@ -265,11 +266,16 @@ def _sanitize(data: dict) -> dict:
         doc_type["code"] = "UNKNOWN"
 
     quality = data.get("quality", {})
-    for f in ("ocrConfidence", "extractionConfidence"):
-        v = quality.get(f, 0)
-        if isinstance(v, (int, float)):
-            quality[f] = round(float(v), 4)
-    quality["warnings"] = [w for w in quality.get("warnings", []) if w in VALID_WARNINGS]
+    # ocrConfidence comes from the vision stage, not the LLM
+    quality["ocrConfidence"] = round(float(ocr_confidence), 4)
+    v = quality.get("extractionConfidence", 0)
+    if isinstance(v, (int, float)):
+        quality["extractionConfidence"] = round(float(v), 4)
+
+    warnings: list[str] = [w for w in quality.get("warnings", []) if w in VALID_WARNINGS]
+    if ocr_confidence < 0.75 and "LOW_OCR_CONFIDENCE" not in warnings:
+        warnings.append("LOW_OCR_CONFIDENCE")
+    quality["warnings"] = warnings
 
     raw = data.get("raw", {})
     raw["pagesReferenced"] = [
@@ -377,7 +383,8 @@ class StructureAgent:
 
             if not errors and parsed is not None:
                 log.info("structure_agent_success", attempt=attempt)
-                sanitized = _sanitize(parsed)
+                ocr_confidence = float(vision_output.get("averageConfidence", 0.0))
+                sanitized = _sanitize(parsed, ocr_confidence)
                 return StructureOutput.model_validate(sanitized), usage_entries, conversation
 
             if attempt < self._max_iterations:
