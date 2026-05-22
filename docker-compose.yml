@@ -29,31 +29,56 @@ services:
     restart: unless-stopped
 
   db:
+    container_name: citizen_link_docai_db
     image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: citizen-link-docai
-      POSTGRES_USER: docai
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docai_password}
+    restart: unless-stopped
+    # ports:
+    #   - '5432:5432'
+    env_file:
+      - .env
     volumes:
       - db_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      # Best practice: ensures the DB uses the exact volume path
+      - PGDATA=/var/lib/postgresql/data/pgdata
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U docai -d citizen-link-docai"]
-      interval: 5s
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 10s
       timeout: 5s
-      retries: 10
-    restart: unless-stopped
+      retries: 5
+      start_period: 30s
 
   redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
+      container_name: citizen_link_docai_redis
+      image: redis:7-alpine
+      restart: unless-stopped
+      command: >
+        sh -c "
+          echo 'user default off' > /tmp/redis.acl &&
+          echo \"user $${REDIS_USERNAME} on >$${REDIS_PASSWORD} ~* &* +@all\" >> /tmp/redis.acl &&
+          redis-server --aclfile /tmp/redis.acl
+        "
+      # ports:
+      #   - '6379:6379'
+      env_file:
+        - .env
+      environment:
+        - REDIS_USERNAME=${REDIS_USERNAME}
+        - REDIS_PASSWORD=${REDIS_PASSWORD}
+      volumes:
+        - redis_data:/data
+      healthcheck:
+        test: ['CMD-SHELL', 'redis-cli -u redis://$${REDIS_USERNAME}:$${REDIS_PASSWORD}@localhost:6379 ping | grep -q PONG']
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 15s
 
 volumes:
   db_data:
+    driver: local
   redis_data:
+    driver: local
