@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from app.config import Settings, get_settings
 from app.dependencies import get_arq_pool, get_pool, require_internal_auth
 from app.exceptions import NotFoundError
+from app.inspection.repository import _loads
 from app.processing.repository import ProcessingRepository
 from app.processing.schemas import (
     ExtractionRequest,
@@ -52,6 +53,8 @@ def _row_to_job(row) -> JobStatusResponse:
         job_type=row["job_type"],
         status=row["status"],
         current_stage=row["current_stage"],
+        webhook_url=row["webhook_url"],
+        input=_loads(row["input"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

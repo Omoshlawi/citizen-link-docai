@@ -14,7 +14,7 @@ JobListResponse   — paginated response from GET /v1/jobs
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -72,6 +72,8 @@ class JobStatusResponse(BaseModel):
     job_type: str
     status: str
     current_stage: Optional[str]
+    webhook_url: str
+    input: Optional[Dict[str, Any]]
     created_at: datetime
     updated_at: datetime
 

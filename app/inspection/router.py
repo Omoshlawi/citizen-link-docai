@@ -146,7 +146,7 @@ async def get_stage(
     stage_id: str,
     request: Request,
     _: str = Depends(require_internal_auth),
-    include_result: bool = Query(False, description="Include raw stage output JSONB"),
+    include_result: bool = Query(True, description="Include raw stage output JSONB"),
     include_conversations: bool = Query(False, description="Nest all LLM correction rounds"),
 ) -> StageDetail:
     repo = InspectionRepository(get_pool(request))
@@ -177,7 +177,7 @@ async def get_job_stages(
     job_id: str,
     request: Request,
     _: str = Depends(require_internal_auth),
-    include_result: bool = Query(False, description="Include raw stage output JSONB"),
+    include_result: bool = Query(True, description="Include raw stage output JSONB"),
     include_conversations: bool = Query(False, description="Nest LLM correction rounds under each stage"),
 ) -> JobStagesResponse:
     repo = InspectionRepository(get_pool(request))
