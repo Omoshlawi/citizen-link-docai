@@ -5,6 +5,7 @@ All queries use asyncpg directly — no ORM.
 Methods return typed JobRecord instances rather than raw asyncpg.Record objects.
 """
 
+import json
 from typing import List, Optional, Tuple
 
 import asyncpg
