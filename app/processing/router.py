@@ -22,7 +22,7 @@ import structlog
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.config import Settings, get_settings
-from app.dependencies import get_pool, require_internal_auth
+from app.dependencies import get_arq_pool, get_pool, require_internal_auth
 from app.exceptions import NotFoundError
 from app.processing.repository import ProcessingRepository
 from app.processing.schemas import (
@@ -43,7 +43,7 @@ def _get_service(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> ProcessingService:
-    return ProcessingService(get_pool(request), settings)
+    return ProcessingService(get_pool(request), get_arq_pool(request), settings)
 
 
 def _row_to_job(row) -> JobStatusResponse:

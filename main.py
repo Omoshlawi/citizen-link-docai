@@ -20,6 +20,8 @@ import logging
 from contextlib import asynccontextmanager
 
 import structlog
+from arq import create_pool as arq_create_pool
+from arq.connections import RedisSettings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -71,14 +73,16 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    # Startup: open DB pool and store it in app.state so routes can access it
+    # Startup: open DB pool and ARQ Redis pool; store in app.state for routes
     app.state.pool = await create_pool(settings)
+    app.state.arq_pool = await arq_create_pool(RedisSettings.from_dsn(settings.redis_url))
     app.state.settings = settings
 
     yield  # ← server is live, handling requests
 
-    # Shutdown: close DB pool cleanly
+    # Shutdown: close both pools cleanly
     await close_pool(app.state.pool)
+    await app.state.arq_pool.aclose()
 
 
 # ── Create app ─────────────────────────────────────────────────────────────────

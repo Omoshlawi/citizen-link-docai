@@ -128,6 +128,7 @@ async def _get_stage_result(
 
 async def _notify_failure(
     pool: asyncpg.Pool,
+    arq_redis,
     settings: Settings,
     job_id: str,
     namespace: str,
@@ -148,12 +149,12 @@ async def _notify_failure(
     await ProcessingRepository(pool).update_status(job_id, JobStatus.FAILED)
 
     await _enqueue_webhook(
-        pool=pool, settings=settings, job_id=job_id,
+        pool=pool, arq_redis=arq_redis, settings=settings, job_id=job_id,
         event=stage_event, callback_url=job.webhook_url,
         result={"reason": reason},
     )
     await _enqueue_webhook(
-        pool=pool, settings=settings, job_id=job_id,
+        pool=pool, arq_redis=arq_redis, settings=settings, job_id=job_id,
         event=rollup_event, callback_url=job.webhook_url,
         result={"failedAt": failed_at.lower(), "reason": reason},
     )
@@ -163,17 +164,14 @@ async def _notify_failure(
 
 async def _enqueue_webhook(
     pool: asyncpg.Pool,
+    arq_redis,
     settings: Settings,
     job_id: str,
     event: DocaiEvent,
     callback_url: str,
     result: Optional[dict] = None,
 ) -> None:
-    from arq import create_pool as arq_create_pool
-    from arq.connections import RedisSettings
-
-    arq_pool = await arq_create_pool(RedisSettings.from_dsn(settings.redis_url))
-    await arq_pool.enqueue_job(
+    await arq_redis.enqueue_job(
         "task_deliver_webhook",
         job_id,
         event,
@@ -181,16 +179,10 @@ async def _enqueue_webhook(
         settings.callback_secret,
         result,
     )
-    await arq_pool.close()
 
 
-async def _enqueue_next(settings: Settings, task_name: str, *args) -> None:
-    from arq import create_pool as arq_create_pool
-    from arq.connections import RedisSettings
-
-    arq_pool = await arq_create_pool(RedisSettings.from_dsn(settings.redis_url))
-    await arq_pool.enqueue_job(task_name, *args)
-    await arq_pool.close()
+async def _enqueue_next(arq_redis, task_name: str, *args) -> None:
+    await arq_redis.enqueue_job(task_name, *args)
 
 
 # ── Generic stage runner ───────────────────────────────────────────────────────
@@ -207,6 +199,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
     from app.pipeline.registry import get_agent, get_pipeline
 
     pool: asyncpg.Pool = ctx["pool"]
+    arq_redis = ctx["redis"]
     settings: Settings = ctx["settings"]
 
     structlog.contextvars.bind_contextvars(job_id=job_id, stage=stage)
@@ -266,13 +259,13 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
                 gate_error = gate(result_model.to_dict())
                 if gate_error:
                     log.warning("stage_gate_failed", stage=stage, reason=gate_error)
-                    await _notify_failure(pool, settings, job_id, pipeline.namespace, stage, gate_error, job)
+                    await _notify_failure(pool, arq_redis, settings, job_id, pipeline.namespace, stage, gate_error, job)
                     return  # expected business outcome — no retry, no exception
 
         # Always fire a per-stage success event with the raw stage output.
         stage_success_event = DocaiEvent(f"{pipeline.namespace}.{stage.lower()}.success")
         await _enqueue_webhook(
-            pool=pool, settings=settings, job_id=job_id,
+            pool=pool, arq_redis=arq_redis, settings=settings, job_id=job_id,
             event=stage_success_event,
             callback_url=job.webhook_url,
             result=result_model.to_dict(),
@@ -281,7 +274,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
         if has_next:
             next_stage = pipeline.stages[next_index]
             log.info("enqueueing_next_stage", next_stage=next_stage)
-            await _enqueue_next(settings, "run_stage", job_id, next_stage)
+            await _enqueue_next(arq_redis, "run_stage", job_id, next_stage)
         else:
             # Final stage — fire the terminal {namespace}.success with the nested combined result.
             all_results = {**previous_results, stage: result_model.to_dict()}
@@ -289,7 +282,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
 
             await repo.update_status(job_id, JobStatus.COMPLETED, current_stage=None)
             await _enqueue_webhook(
-                pool=pool, settings=settings, job_id=job_id,
+                pool=pool, arq_redis=arq_redis, settings=settings, job_id=job_id,
                 event=pipeline_success_event,
                 callback_url=job.webhook_url,
                 result=pipeline.build_result(all_results),
@@ -305,7 +298,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
             started_at=started_at,
         )
         await _store_conversation(pool, stage_id, job_id, exc.conversation)
-        await _notify_failure(pool, settings, job_id, pipeline.namespace, stage, str(exc), job)
+        await _notify_failure(pool, arq_redis, settings, job_id, pipeline.namespace, stage, str(exc), job)
         raise
 
     except Exception as exc:
@@ -316,7 +309,7 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
             error=str(exc),
             started_at=started_at,
         )
-        await _notify_failure(pool, settings, job_id, pipeline.namespace, stage, str(exc), job)
+        await _notify_failure(pool, arq_redis, settings, job_id, pipeline.namespace, stage, str(exc), job)
         raise
 
 

@@ -18,8 +18,13 @@ log = structlog.get_logger(__name__)
 
 
 def get_pool(request: Request) -> asyncpg.Pool:
-    """Return the connection pool stored in app.state at startup."""
+    """Return the asyncpg connection pool stored in app.state at startup."""
     return request.app.state.pool
+
+
+def get_arq_pool(request: Request):
+    """Return the shared ARQ Redis pool stored in app.state at startup."""
+    return request.app.state.arq_pool
 
 
 async def require_internal_auth(

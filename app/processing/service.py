@@ -12,10 +12,9 @@ name is hard-coded here.
 """
 
 import structlog
-from arq import create_pool as arq_create_pool
-from arq.connections import RedisSettings
 
 from app.config import Settings
+from app.pipeline.enums import JobStatus
 from app.pipeline.registry import get_pipeline
 from app.processing.repository import ProcessingRepository
 from app.processing.schemas import ExtractionRequest
@@ -24,8 +23,9 @@ log = structlog.get_logger(__name__)
 
 
 class ProcessingService:
-    def __init__(self, pool, settings: Settings) -> None:
+    def __init__(self, pool, arq_pool, settings: Settings) -> None:
         self._repo = ProcessingRepository(pool)
+        self._arq_pool = arq_pool
         self._settings = settings
 
     # ── Public submit methods (one per pipeline) ───────────────────────────────
@@ -83,10 +83,12 @@ class ProcessingService:
             first_stage=first_stage,
         )
 
-        redis_settings = RedisSettings.from_dsn(self._settings.redis_url)
-        arq_pool = await arq_create_pool(redis_settings)
-        await arq_pool.enqueue_job("run_stage", job_id, first_stage)
-        await arq_pool.close()
+        try:
+            await self._arq_pool.enqueue_job("run_stage", job_id, first_stage)
+        except Exception as exc:
+            log.error("pipeline_enqueue_failed", job_id=job_id, error=str(exc))
+            await self._repo.update_status(job_id, JobStatus.FAILED)
+            raise
 
         log.info("pipeline_enqueued", job_id=job_id, stage=first_stage)
         return job_id
