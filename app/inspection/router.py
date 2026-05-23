@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from app.dependencies import get_pool, require_internal_auth
 from app.exceptions import NotFoundError
-from app.inspection.repository import InspectionRepository, _loads
+from app.inspection.repository import InspectionRepository
 from app.inspection.schemas import (
     ConversationListResponse,
     ConversationResponse,
@@ -35,61 +35,62 @@ from app.inspection.schemas import (
     WebhookDeliveryListResponse,
     WebhookDeliveryResponse,
 )
+from app.models.inspection import ConversationRecord, StageRecord, WebhookRecord
 
 router = APIRouter(tags=["inspection"])
 
 
-# ── Row → schema helpers ───────────────────────────────────────────────────────
+# ── Model → schema helpers ─────────────────────────────────────────────────────
 
-def _to_stage(row, *, include_result: bool = False) -> StageResponse:
+def _to_stage(stage: StageRecord) -> StageResponse:
     return StageResponse(
-        stage_id=row["stage_id"],
-        job_id=row["job_id"],
-        stage=row["stage"],
-        status=row["status"],
-        error=row["error"],
-        usage=_loads(row["usage"]),
-        started_at=row["started_at"],
-        completed_at=row["completed_at"],
-        created_at=row["created_at"],
-        result=_loads(row["result"]) if include_result else None,
-        job_type=row["job_type"],
-        job_status=row["job_status"],
+        stage_id=stage.stage_id,
+        job_id=stage.job_id,
+        stage=stage.stage,
+        status=stage.status,
+        error=stage.error,
+        usage=stage.usage,
+        started_at=stage.started_at,
+        completed_at=stage.completed_at,
+        created_at=stage.created_at,
+        result=stage.result,
+        job_type=stage.job_type,
+        job_status=stage.job_status,
     )
 
 
-def _to_conversation(row) -> ConversationResponse:
+def _to_conversation(conv: ConversationRecord) -> ConversationResponse:
     return ConversationResponse(
-        conversation_id=row["conversation_id"],
-        stage_id=row["stage_id"],
-        job_id=row["job_id"],
-        round=row["round"],
-        page=row["page"],
-        role=row["role"],
-        content=row["content"],
-        success=row["success"],
-        metadata=_loads(row["metadata"]),
-        created_at=row["created_at"],
-        stage_name=row["stage_name"],
-        stage_status=row["stage_status"],
-        job_type=row["job_type"],
+        conversation_id=conv.conversation_id,
+        stage_id=conv.stage_id,
+        job_id=conv.job_id,
+        round=conv.round,
+        page=conv.page,
+        role=conv.role,
+        content=conv.content,
+        success=conv.success,
+        metadata=conv.metadata,
+        created_at=conv.created_at,
+        stage_name=conv.stage_name,
+        stage_status=conv.stage_status,
+        job_type=conv.job_type,
     )
 
 
-def _to_webhook(row) -> WebhookDeliveryResponse:
+def _to_webhook(webhook: WebhookRecord) -> WebhookDeliveryResponse:
     return WebhookDeliveryResponse(
-        delivery_id=row["delivery_id"],
-        job_id=row["job_id"],
-        event=row["event"],
-        callback_url=row["callback_url"],
-        response_status=row["response_status"],
-        response_body=row["response_body"],
-        attempt_count=row["attempt_count"],
-        delivered=row["delivered"],
-        created_at=row["created_at"],
-        payload=_loads(row["payload"]),
-        job_type=row["job_type"],
-        job_status=row["job_status"],
+        delivery_id=webhook.delivery_id,
+        job_id=webhook.job_id,
+        event=webhook.event,
+        callback_url=webhook.callback_url,
+        response_status=webhook.response_status,
+        response_body=webhook.response_body,
+        attempt_count=webhook.attempt_count,
+        delivered=webhook.delivered,
+        created_at=webhook.created_at,
+        payload=webhook.payload,
+        job_type=webhook.job_type,
+        job_status=webhook.job_status,
     )
 
 
@@ -127,7 +128,7 @@ async def list_stages(
         include_result=include_result, page=page, page_size=page_size,
     )
     return StageListResponse(
-        stages=[_to_stage(r, include_result=include_result) for r in rows],
+        stages=[_to_stage(r) for r in rows],
         total=total, page=page, page_size=page_size,
     )
 
@@ -159,7 +160,7 @@ async def get_stage(
         conv_rows = await repo.list_conversations_for_stage(stage_id)
         conversations = [_to_conversation(r) for r in conv_rows]
 
-    return StageDetail(**_to_stage(row, include_result=include_result).model_dump(), conversations=conversations)
+    return StageDetail(**_to_stage(row).model_dump(), conversations=conversations)
 
 
 @router.get(
@@ -207,7 +208,7 @@ async def get_job_stages(
     first = stage_rows[0]
     stages = [
         StageDetail(
-            **_to_stage(r, include_result=include_result).model_dump(),
+            **_to_stage(r).model_dump(),
             conversations=conv_by_stage.get(r["stage_id"], []),
         )
         for r in stage_rows

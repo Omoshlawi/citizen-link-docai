@@ -206,12 +206,11 @@ async def run_stage(ctx: dict, job_id: str, stage: str) -> None:
     log.info("stage_started")
 
     repo = ProcessingRepository(pool)
-    row = await repo.get_job(job_id)
-    if not row:
+    job = await repo.get_job(job_id)
+    if not job:
         log.error("job_not_found")
         return
 
-    job = JobRecord.from_record(row)
     await repo.update_status(job_id, JobStatus.IN_PROGRESS, current_stage=stage)
     started_at = datetime.now(timezone.utc)
 

@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from app.config import Settings, get_settings
 from app.dependencies import get_arq_pool, get_pool, require_internal_auth
 from app.exceptions import NotFoundError
-from app.inspection.repository import _loads
+from app.models.pipeline import JobRecord
 from app.processing.repository import ProcessingRepository
 from app.processing.schemas import (
     ExtractionRequest,
@@ -47,16 +47,16 @@ def _get_service(
     return ProcessingService(get_pool(request), get_arq_pool(request), settings)
 
 
-def _row_to_job(row) -> JobStatusResponse:
+def _job_to_response(job: JobRecord) -> JobStatusResponse:
     return JobStatusResponse(
-        job_id=str(row["id"]),
-        job_type=row["job_type"],
-        status=row["status"],
-        current_stage=row["current_stage"],
-        webhook_url=row["webhook_url"],
-        input=_loads(row["input"]),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        job_id=job.id,
+        job_type=job.job_type,
+        status=job.status,
+        current_stage=job.current_stage,
+        webhook_url=job.webhook_url,
+        input=job.input,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
     )
 
 
@@ -131,7 +131,7 @@ async def list_jobs(
         job_type=job_type, status=status, page=page, page_size=page_size
     )
     return JobListResponse(
-        jobs=[_row_to_job(row) for row in rows],
+        jobs=[_job_to_response(row) for row in rows],
         total=total,
         page=page,
         page_size=page_size,
@@ -157,4 +157,4 @@ async def get_job_status(
     row = await ProcessingRepository(pool).get_job(job_id)
     if not row:
         raise NotFoundError(f"Job {job_id} not found")
-    return _row_to_job(row)
+    return _job_to_response(row)

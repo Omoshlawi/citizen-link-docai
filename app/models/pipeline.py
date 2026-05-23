@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 import asyncpg
@@ -165,7 +166,7 @@ class JobRecord:
     """
     Typed view of a processing_jobs row.
 
-    Eliminates string-key dict access across pipeline tasks.
+    Eliminates string-key dict access across pipeline tasks and routers.
     Use JobRecord.from_record(row) wherever you'd otherwise do row["job_type"] etc.
     """
     id: str
@@ -174,6 +175,8 @@ class JobRecord:
     webhook_url: str
     status: str
     current_stage: Optional[str]
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     @classmethod
     def from_record(cls, row: asyncpg.Record) -> JobRecord:
@@ -193,4 +196,6 @@ class JobRecord:
             webhook_url=row["webhook_url"],
             status=row["status"],
             current_stage=row.get("current_stage"),
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
         )

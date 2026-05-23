@@ -3,6 +3,8 @@ InspectionRepository — read-only queries across processing_stages,
 stage_conversations, and webhook_deliveries, with joins to processing_jobs.
 
 All queries use asyncpg directly.  No ORM, no magic.
+All methods return typed domain model instances (StageRecord, ConversationRecord,
+WebhookRecord) rather than raw asyncpg.Record objects.
 
 Condition builder pattern
 --------------------------
@@ -13,19 +15,11 @@ same order the condition references them — so the $N numbers always match.
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import asyncpg
 
-
-def _loads(v: Any) -> Optional[Dict]:
-    """Safely decode a JSONB value (asyncpg returns it as a string)."""
-    if v is None:
-        return None
-    if isinstance(v, str):
-        return json.loads(v)
-    return v  # already a dict in some asyncpg versions
+from app.models.inspection import ConversationRecord, StageRecord, WebhookRecord
 
 
 class InspectionRepository:
@@ -44,7 +38,7 @@ class InspectionRepository:
         include_result: bool = False,
         page: int = 1,
         page_size: int = 20,
-    ) -> Tuple[List[asyncpg.Record], int]:
+    ) -> Tuple[List[StageRecord], int]:
         """
         Paginated stage list joined with processing_jobs.
 
@@ -108,17 +102,17 @@ class InspectionRepository:
             *params,
         )
 
-        return rows, total
+        return [StageRecord.from_record(r) for r in rows], total
 
     async def get_stage(
         self,
         stage_id: str,
         *,
         include_result: bool = False,
-    ) -> Optional[asyncpg.Record]:
+    ) -> Optional[StageRecord]:
         """Single stage row joined with its parent job."""
         result_col = "ps.result" if include_result else "NULL::jsonb AS result"
-        return await self._pool.fetchrow(
+        row = await self._pool.fetchrow(
             f"""
             SELECT
                 ps.id::text          AS stage_id,
@@ -139,16 +133,17 @@ class InspectionRepository:
             """,
             stage_id,
         )
+        return StageRecord.from_record(row) if row else None
 
     async def list_stages_for_job(
         self,
         job_id: str,
         *,
         include_result: bool = False,
-    ) -> List[asyncpg.Record]:
+    ) -> List[StageRecord]:
         """All stages for one job, oldest first (pipeline order)."""
         result_col = "ps.result" if include_result else "NULL::jsonb AS result"
-        return await self._pool.fetch(
+        rows = await self._pool.fetch(
             f"""
             SELECT
                 ps.id::text          AS stage_id,
@@ -170,6 +165,7 @@ class InspectionRepository:
             """,
             job_id,
         )
+        return [StageRecord.from_record(r) for r in rows]
 
     # ── Stage conversations ────────────────────────────────────────────────────
 
@@ -183,7 +179,7 @@ class InspectionRepository:
         page_num: Optional[int] = None,
         page: int = 1,
         page_size: int = 20,
-    ) -> Tuple[List[asyncpg.Record], int]:
+    ) -> Tuple[List[ConversationRecord], int]:
         """
         Paginated conversation list joined with processing_stages and processing_jobs.
 
@@ -252,14 +248,14 @@ class InspectionRepository:
             *params,
         )
 
-        return rows, total
+        return [ConversationRecord.from_record(r) for r in rows], total
 
     async def list_conversations_for_stage(
         self,
         stage_id: str,
-    ) -> List[asyncpg.Record]:
+    ) -> List[ConversationRecord]:
         """All message turns for one stage, ordered by round then insertion order."""
-        return await self._pool.fetch(
+        rows = await self._pool.fetch(
             """
             SELECT
                 sc.id::text          AS conversation_id,
@@ -283,13 +279,14 @@ class InspectionRepository:
             """,
             stage_id,
         )
+        return [ConversationRecord.from_record(r) for r in rows]
 
     async def list_conversations_for_job(
         self,
         job_id: str,
-    ) -> List[asyncpg.Record]:
+    ) -> List[ConversationRecord]:
         """All message turns across all stages for one job."""
-        return await self._pool.fetch(
+        rows = await self._pool.fetch(
             """
             SELECT
                 sc.id::text          AS conversation_id,
@@ -313,6 +310,7 @@ class InspectionRepository:
             """,
             job_id,
         )
+        return [ConversationRecord.from_record(r) for r in rows]
 
     # ── Webhook deliveries ─────────────────────────────────────────────────────
 
@@ -324,7 +322,7 @@ class InspectionRepository:
         delivered: Optional[bool] = None,
         page: int = 1,
         page_size: int = 20,
-    ) -> Tuple[List[asyncpg.Record], int]:
+    ) -> Tuple[List[WebhookRecord], int]:
         """
         Paginated webhook delivery list joined with processing_jobs.
 
@@ -383,11 +381,11 @@ class InspectionRepository:
             *params,
         )
 
-        return rows, total
+        return [WebhookRecord.from_record(r) for r in rows], total
 
-    async def get_webhook(self, delivery_id: str) -> Optional[asyncpg.Record]:
+    async def get_webhook(self, delivery_id: str) -> Optional[WebhookRecord]:
         """Single delivery record with full payload, joined with its parent job."""
-        return await self._pool.fetchrow(
+        row = await self._pool.fetchrow(
             """
             SELECT
                 wd.id::text          AS delivery_id,
@@ -408,3 +406,4 @@ class InspectionRepository:
             """,
             delivery_id,
         )
+        return WebhookRecord.from_record(row) if row else None

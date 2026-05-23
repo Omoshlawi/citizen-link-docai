@@ -1,14 +1,16 @@
 """
-ProcessingRepository — raw SQL operations on the processing_jobs table.
+ProcessingRepository — SQL operations on the processing_jobs table.
 
 All queries use asyncpg directly — no ORM.
+Methods return typed JobRecord instances rather than raw asyncpg.Record objects.
 """
 
-import json
 from typing import List, Optional, Tuple
 
 import asyncpg
 import structlog
+
+from app.models.pipeline import JobRecord
 
 log = structlog.get_logger(__name__)
 
@@ -36,12 +38,13 @@ class ProcessingRepository:
         )
         return row["id"]
 
-    async def get_job(self, job_id: str) -> Optional[asyncpg.Record]:
+    async def get_job(self, job_id: str) -> Optional[JobRecord]:
         """Fetch a job by UUID. Returns None if not found."""
-        return await self._pool.fetchrow(
+        row = await self._pool.fetchrow(
             "SELECT * FROM processing_jobs WHERE id = $1::uuid",
             job_id,
         )
+        return JobRecord.from_record(row) if row else None
 
     async def list_jobs(
         self,
@@ -49,7 +52,7 @@ class ProcessingRepository:
         status: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
-    ) -> Tuple[List[asyncpg.Record], int]:
+    ) -> Tuple[List[JobRecord], int]:
         """
         Return a paginated list of jobs and the total count, newest first.
 
@@ -86,7 +89,7 @@ class ProcessingRepository:
             *params,
         )
 
-        return rows, total
+        return [JobRecord.from_record(r) for r in rows], total
 
     async def update_status(
         self,
