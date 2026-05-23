@@ -39,7 +39,8 @@ class ProcessingService:
         """
         job_input = {
             "case_number": request.case_number,
-            "image_urls": request.image_urls,
+            "image_keys": request.image_keys,
+            "webhook_url": request.webhook_url,
         }
         return await self._enqueue("EXTRACTION", job_input, request.webhook_url)
 

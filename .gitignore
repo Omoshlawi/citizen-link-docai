@@ -1,2 +1,4 @@
 .env
 .venv/
+.env.production.local
+.env.development.local

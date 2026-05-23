@@ -25,18 +25,18 @@ class ExtractionRequest(BaseModel):
     """
     POST /v1/jobs/extraction — OCR + structured field extraction.
 
-    The caller (NestJS) generates pre-signed image URLs before calling docai.
-    The signature is embedded in each URL so docai can download via plain HTTP
-    with no credentials.
+    The caller (NestJS) passes raw S3 object keys. Docai fetches the images
+    via the NestJS internal stream endpoint (authenticated with X-Internal-Secret)
+    rather than using presigned URLs that break across Docker host boundaries.
     """
     case_number: str = Field(
         ...,
         description="Human-readable case reference — used for logging and image organisation.",
     )
-    image_urls: list[str] = Field(
+    image_keys: list[str] = Field(
         ...,
         min_length=1,
-        description="Pre-signed MinIO URLs for the document images, in page order.",
+        description="S3 object keys for the document images, in page order.",
     )
     webhook_url: str = Field(
         ...,

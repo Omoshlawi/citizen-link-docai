@@ -17,5 +17,9 @@ fi
 echo "🗄️  Running Alembic migrations..."
 alembic upgrade head && echo "✅ Migrations applied." || { echo "❌ Migrations failed. Exiting."; exit 1; }
 
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+
 echo "🚀 Starting API server on port 8002..."
 exec uvicorn main:app --host 0.0.0.0 --port 8002

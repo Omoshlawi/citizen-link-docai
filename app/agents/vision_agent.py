@@ -20,6 +20,7 @@ import json
 import re
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -166,20 +167,25 @@ class VisionAgent:
     def __init__(self, settings: Settings) -> None:
         self._model = settings.vision_ai_model
         self._max_iterations = settings.max_agent_iterations
+        self._internal_secret = settings.internal_secret
         self._client = AsyncOpenAI(
             base_url=settings.vision_ai_base_url,
             api_key=settings.vision_ai_api_key,
         )
 
-    async def _download_image(self, url: str) -> tuple[bytes, str]:
+    async def _download_image(self, key: str, caller_base_url: str) -> tuple[bytes, str]:
         """
-        Download a document image from a pre-signed MinIO URL.
+        Download a document image via the caller's internal stream endpoint.
 
-        NestJS generates the pre-signed URL before calling docai — the
-        signature is embedded in the URL so no credentials are needed here.
+        Uses X-Internal-Secret auth so no presigned URLs are needed — avoids
+        signature invalidation when the hostname changes between Docker containers.
+        The caller base URL is derived from the webhook_url provided at job submission.
         """
+        url = f"{caller_base_url}/api/files/internal-stream?key={key}&bucket=tmp"
         async with httpx.AsyncClient(timeout=30) as http:
-            response = await http.get(url)
+            response = await http.get(
+                url, headers={"X-Internal-Secret": self._internal_secret}
+            )
             response.raise_for_status()
         content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
         return response.content, content_type
@@ -266,7 +272,8 @@ class VisionAgent:
     async def _extract_page(
         self,
         page_num: int,
-        url: str,
+        key: str,
+        caller_base_url: str,
         provider: str,
     ) -> tuple[VisionOutput, list[UsageEntry], list[ConversationEntry]]:
         """
@@ -276,8 +283,8 @@ class VisionAgent:
         Raises AgentExhaustedError — carrying this page's conversation trail —
         if all correction attempts are exhausted.
         """
-        log.info("vision_agent_downloading_image", page=page_num, url=url[:80])
-        image_bytes, mime_type = await self._download_image(url)
+        log.info("vision_agent_downloading_image", page=page_num, key=key)
+        image_bytes, mime_type = await self._download_image(key, caller_base_url)
 
         messages = self._build_initial_messages(image_bytes, mime_type)
         usage_entries: list[UsageEntry] = []
@@ -292,7 +299,7 @@ class VisionAgent:
             ConversationEntry(
                 round=1, page=page_num, role="user",
                 content=VISION_USER_PROMPT,
-                metadata={"url": url, "mime_type": mime_type},
+                metadata={"key": key, "mime_type": mime_type},
             ),
         ]
 
@@ -355,7 +362,8 @@ class VisionAgent:
 
     async def extract(
         self,
-        image_urls: list[str],
+        image_keys: list[str],
+        caller_base_url: str,
     ) -> tuple[VisionOutput, list[UsageEntry], list[ConversationEntry]]:
         """
         Run vision extraction on all provided images in parallel.
@@ -374,8 +382,8 @@ class VisionAgent:
         )
 
         tasks = [
-            self._extract_page(page_num, url, provider)
-            for page_num, url in enumerate(image_urls, start=1)
+            self._extract_page(page_num, key, caller_base_url, provider)
+            for page_num, key in enumerate(image_keys, start=1)
         ]
 
         try:
@@ -422,12 +430,15 @@ class VisionAgent:
         """
         Unified agent interface called by the generic run_stage task.
 
-        Extracts image_urls from job_input and delegates to extract().
-        previous_results is unused — VISION is always the first stage.
+        Derives the caller base URL from webhook_url, extracts image_keys,
+        and delegates to extract(). previous_results is unused — VISION is always the first stage.
         """
-        image_urls: list[str] = job_input.get("image_urls", [])
-        if not image_urls:
+        image_keys: list[str] = job_input.get("image_keys", [])
+        if not image_keys:
             raise ValueError(
-                "job_input must contain a non-empty 'image_urls' list for VISION stage"
+                "job_input must contain a non-empty 'image_keys' list for VISION stage"
             )
-        return await self.extract(image_urls)
+        webhook_url: str = job_input.get("webhook_url", "")
+        parsed = urlparse(webhook_url)
+        caller_base_url = f"{parsed.scheme}://{parsed.netloc}"
+        return await self.extract(image_keys, caller_base_url)
