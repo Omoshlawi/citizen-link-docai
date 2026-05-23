@@ -172,7 +172,6 @@ class JobRecord:
     job_type: str
     input: dict
     webhook_url: str
-    priority: int
     status: str
     current_stage: Optional[str]
 
@@ -192,7 +191,6 @@ class JobRecord:
             job_type=row["job_type"],
             input=job_input,
             webhook_url=row["webhook_url"],
-            priority=row["priority"],
             status=row["status"],
             current_stage=row.get("current_stage"),
         )

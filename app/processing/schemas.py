@@ -42,12 +42,6 @@ class ExtractionRequest(BaseModel):
         ...,
         description="Caller's webhook URL — docai POSTs stage callbacks here.",
     )
-    priority: int = Field(
-        default=5,
-        ge=1,
-        le=10,
-        description="Job priority (1 = highest, 10 = lowest). Default 5.",
-    )
 
 
 # ── Future pipeline schemas slot in here:
@@ -57,14 +51,12 @@ class ExtractionRequest(BaseModel):
 #     document_id: str
 #     extraction_job_id: str
 #     webhook_url: str
-#     priority: int = Field(default=5, ge=1, le=10)
 #
 # class MatchVerificationRequest(BaseModel):
 #     """POST /v1/jobs/match-verification"""
 #     claim_id: str
 #     candidate_ids: list[str] = Field(..., min_length=1)
 #     webhook_url: str
-#     priority: int = Field(default=5, ge=1, le=10)
 
 
 # ── Shared response schemas ────────────────────────────────────────────────────
@@ -78,7 +70,6 @@ class JobStatusResponse(BaseModel):
     """Single-job status — returned by GET /v1/jobs/{job_id}."""
     job_id: str
     job_type: str
-    priority: int
     status: str
     current_stage: Optional[str]
     created_at: datetime

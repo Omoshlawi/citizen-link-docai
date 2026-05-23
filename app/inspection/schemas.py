@@ -45,7 +45,6 @@ class StageResponse(BaseModel):
     # Joined from processing_jobs
     job_type: str
     job_status: str
-    job_priority: int
 
 
 class StageListResponse(Page):

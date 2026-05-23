@@ -41,17 +41,17 @@ class ProcessingService:
             "case_number": request.case_number,
             "image_urls": request.image_urls,
         }
-        return await self._enqueue("EXTRACTION", job_input, request.webhook_url, request.priority)
+        return await self._enqueue("EXTRACTION", job_input, request.webhook_url)
 
     # Future pipelines slot in here without touching the worker or registry:
     #
     # async def submit_fraud_check(self, request: FraudCheckRequest) -> str:
     #     job_input = {"document_id": request.document_id, ...}
-    #     return await self._enqueue("FRAUD_DETECTION", job_input, request.webhook_url, request.priority)
+    #     return await self._enqueue("FRAUD_DETECTION", job_input, request.webhook_url)
     #
     # async def submit_match_verification(self, request: MatchVerificationRequest) -> str:
     #     job_input = {"claim_id": request.claim_id, "candidate_ids": request.candidate_ids}
-    #     return await self._enqueue("MATCH_VERIFICATION", job_input, request.webhook_url, request.priority)
+    #     return await self._enqueue("MATCH_VERIFICATION", job_input, request.webhook_url)
 
     # ── Internal helper ────────────────────────────────────────────────────────
 
@@ -60,7 +60,6 @@ class ProcessingService:
         job_type: str,
         job_input: dict,
         webhook_url: str,
-        priority: int,
     ) -> str:
         """
         Persist the job and enqueue the first stage via ARQ.
@@ -75,7 +74,6 @@ class ProcessingService:
             job_type=job_type,
             input=job_input,
             webhook_url=webhook_url,
-            priority=priority,
         )
 
         log.info(
@@ -83,7 +81,6 @@ class ProcessingService:
             job_id=job_id,
             job_type=job_type,
             first_stage=first_stage,
-            priority=priority,
         )
 
         redis_settings = RedisSettings.from_dsn(self._settings.redis_url)

@@ -22,19 +22,17 @@ class ProcessingRepository:
         job_type: str,
         input: dict,
         webhook_url: str,
-        priority: int = 5,
     ) -> str:
         """Insert a new PENDING job and return its UUID."""
         row = await self._pool.fetchrow(
             """
-            INSERT INTO processing_jobs (job_type, input, webhook_url, priority, status)
-            VALUES ($1, $2::jsonb, $3, $4, 'PENDING')
+            INSERT INTO processing_jobs (job_type, input, webhook_url, status)
+            VALUES ($1, $2::jsonb, $3, 'PENDING')
             RETURNING id::text
             """,
             job_type,
             json.dumps(input),
             webhook_url,
-            priority,
         )
         return row["id"]
 

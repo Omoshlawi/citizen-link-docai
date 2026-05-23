@@ -88,8 +88,7 @@ class InspectionRepository:
                 ps.created_at,
                 {result_col},
                 pj.job_type,
-                pj.status            AS job_status,
-                pj.priority          AS job_priority
+                pj.status            AS job_status
             FROM processing_stages ps
             JOIN processing_jobs pj ON pj.id = ps.job_id
             {where}
@@ -133,8 +132,7 @@ class InspectionRepository:
                 ps.created_at,
                 {result_col},
                 pj.job_type,
-                pj.status            AS job_status,
-                pj.priority          AS job_priority
+                pj.status            AS job_status
             FROM processing_stages ps
             JOIN processing_jobs pj ON pj.id = ps.job_id
             WHERE ps.id = $1::uuid
@@ -164,8 +162,7 @@ class InspectionRepository:
                 ps.created_at,
                 {result_col},
                 pj.job_type,
-                pj.status            AS job_status,
-                pj.priority          AS job_priority
+                pj.status            AS job_status
             FROM processing_stages ps
             JOIN processing_jobs pj ON pj.id = ps.job_id
             WHERE ps.job_id = $1::uuid

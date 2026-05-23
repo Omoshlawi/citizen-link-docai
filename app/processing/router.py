@@ -50,7 +50,6 @@ def _row_to_job(row) -> JobStatusResponse:
     return JobStatusResponse(
         job_id=str(row["id"]),
         job_type=row["job_type"],
-        priority=row["priority"],
         status=row["status"],
         current_stage=row["current_stage"],
         created_at=row["created_at"],

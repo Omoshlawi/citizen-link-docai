@@ -55,7 +55,6 @@ def _to_stage(row, *, include_result: bool = False) -> StageResponse:
         result=_loads(row["result"]) if include_result else None,
         job_type=row["job_type"],
         job_status=row["job_status"],
-        job_priority=row["job_priority"],
     )
 
 
