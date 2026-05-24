@@ -192,8 +192,8 @@ async def get_job_stages(
             raise NotFoundError(f"Job {job_id} not found")
         return JobStagesResponse(
             job_id=job_id,
-            job_type=job["job_type"],
-            job_status=job["status"],
+            job_type=job.job_type,
+            job_status=job.status,
             stages=[],
         )
 
@@ -202,22 +202,22 @@ async def get_job_stages(
     if include_conversations:
         conv_rows = await repo.list_conversations_for_job(job_id)
         for r in conv_rows:
-            sid = r["stage_id"]
+            sid = r.stage_id
             conv_by_stage.setdefault(sid, []).append(_to_conversation(r))
 
     first = stage_rows[0]
     stages = [
         StageDetail(
             **_to_stage(r).model_dump(),
-            conversations=conv_by_stage.get(r["stage_id"], []),
+            conversations=conv_by_stage.get(r.stage_id, []),
         )
         for r in stage_rows
     ]
 
     return JobStagesResponse(
         job_id=job_id,
-        job_type=first["job_type"],
-        job_status=first["job_status"],
+        job_type=first.job_type,
+        job_status=first.job_status,
         stages=stages,
     )
 
