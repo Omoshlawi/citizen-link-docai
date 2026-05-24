@@ -15,6 +15,7 @@ from typing import Optional
 
 import structlog
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 
 from app.agents.exceptions import AgentExhaustedError
 from app.config import Settings
@@ -248,6 +249,23 @@ def _validate_structure_output(data: dict) -> list[str]:
             if invalid:
                 errors.append(f"quality.warnings contains unknown codes: {invalid}")
 
+    additional_fields = data.get("additionalFields", [])
+    if not isinstance(additional_fields, list):
+        errors.append("additionalFields must be an array")
+    else:
+        for i, field in enumerate(additional_fields):
+            if not isinstance(field, dict):
+                errors.append(f"additionalFields[{i}] must be an object with fieldName and fieldValue")
+            else:
+                if not isinstance(field.get("fieldName"), str) or not field.get("fieldName"):
+                    errors.append(f"additionalFields[{i}].fieldName must be a non-empty string")
+                if not isinstance(field.get("fieldValue"), str):
+                    errors.append(
+                        f"additionalFields[{i}].fieldValue must be a string — "
+                        f"got {type(field.get('fieldValue')).__name__}. "
+                        "Use an empty string if the value is unknown, or omit this field entirely."
+                    )
+
     return errors
 
 
@@ -385,7 +403,14 @@ class StructureAgent:
                 log.info("structure_agent_success", attempt=attempt)
                 ocr_confidence = float(vision_output.get("averageConfidence", 0.0))
                 sanitized = _sanitize(parsed, ocr_confidence)
-                return StructureOutput.model_validate(sanitized), usage_entries, conversation
+                try:
+                    return StructureOutput.model_validate(sanitized), usage_entries, conversation
+                except ValidationError as exc:
+                    errors = [
+                        f"Output failed schema validation: {err['loc']}: {err['msg']}"
+                        for err in exc.errors()
+                    ]
+                    log.warning("structure_agent_pydantic_validation_failed", attempt=attempt, errors=errors)
 
             if attempt < self._max_iterations:
                 correction_text = (
