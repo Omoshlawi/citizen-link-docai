@@ -5,6 +5,30 @@ services:
     ports:
       - "8002:8002"
     env_file: .env
+    environment:
+      # App config
+      - DATABASE_URL=${DATABASE_URL}
+      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - REDIS_URL=${REDIS_URL}
+      # Embedding Config
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - EMBEDDING_IS_OPENAI=${EMBEDDING_IS_OPENAI}
+      # Vision AI Config
+      - VISION_AI_BASE_URL=${VISION_AI_BASE_URL}
+      - VISION_AI_MODEL=${VISION_AI_MODEL}
+      - VISION_AI_API_KEY=${VISION_AI_API_KEY}   
+      # Text Extraction AI Config
+      - STRUCTURE_AI_BASE_URL=${STRUCTURE_AI_BASE_URL}
+      - STRUCTURE_AI_MODEL=${STRUCTURE_AI_MODEL}
+      - STRUCTURE_AI_API_KEY=${STRUCTURE_AI_API_KEY}
+      # Interservice auth
+      - INTERNAL_SECRET=${INTERNAL_SECRET}
+      - CALLBACK_SECRET=${CALLBACK_SECRET}
+      # Agent tuning
+      - MAX_AGENT_ITERATIONS=${MAX_AGENT_ITERATIONS}      
     depends_on:
       db:
         condition: service_healthy
